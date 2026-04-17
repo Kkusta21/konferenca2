@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="sq">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Konferenca · Skaner</title>
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, collection, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyDvIs7NNrM_1C7Jb2DWULKiKvCUrtJVzTg",
+    authDomain: "konferenca.firebaseapp.com",
+    projectId: "konferenca",
+    storageBucket: "konferenca.firebasestorage.app",
+    messagingSenderId: "862842008546",
+    appId: "1:862842008546:web:b22caae19c00db52453fbb"
+  };
+
+  const db = getFirestore(initializeApp(firebaseConfig));
+  let events = [], attendees = [], selectedEventId = null;
+
+  function nowStr() { return new Date().toLocaleTimeString('sq-AL',{hour:'2-digit',minute:'2-digit',second:'2-digit'}); }
+
+  // Load events
+  onSnapshot(query(collection(db,'events'), orderBy('createdAt','asc')), snap => {
+    events = snap.docs.map(d=>({id:d.id,...d.data()}));
+    renderEventSelect();
+  });
+
+  // Load attendees live
+  onSnapshot(query(collection(db,'attendees'), orderBy('createdAt','asc')), snap => {
+    attendees = snap.docs.map(d=>({id:d.id,...d.data()}));
+    if (selectedEventId) { renderAttendanceList(); updateStats(); }
+  });
+
+  function renderEventSelect() {
+    const sel = document.getElementById('event-select');
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">— Zgjidhni eventin —</option>' +
+      events.map(e=>`<option value="${e.id}">${e.name}</option>`).join('');
+    if (prev) { sel.value = prev; }
+  }
+
+  window.selectEvent = function() {
+    selectedEventId = document.getElementById('event-select').value || null;
+    const scanArea = document.getElementById('scan-section');
+    const emptyMsg = document.getElementById('no-event-msg');
+    if (selectedEventId) {
+      scanArea.style.display  = 'block';
+      emptyMsg.style.display  = 'none';
+      renderAttendanceList();
+      updateStats();
+      document.getElementById('scan-input').focus();
+    } else {
+      scanArea.style.display = 'none';
+      emptyMsg.style.display = 'block';
+    }
+  };
+
+  function updateStats() {
+    if (!selectedEventId) return;
+    const checked = attendees.filter(a => (a.checkedInEvents||[]).includes(selectedEventId)).length;
+    const total   = attendees.length;
+    document.getElementById('stat-checked').textContent = checked;
+    document.getElementById('stat-total').textContent   = total;
+    document.getElementById('stat-left').textContent    = total - checked;
+  }
+
+  function renderAttendanceList() {
+    if (!selectedEventId) return;
+    const list = attendees.filter(a => (a.checkedInEvents||[]).includes(selectedEventId))
+      .sort((a,b) => (b.checkedAt||'').localeCompare(a.checkedAt||''));
+    const el = document.getElementById('attendance-list');
+    if (!list.length) {
+      el.innerHTML = '<div class="empty-sm">Asnjë pjesëmarrës i pranuar ende për këtë event.</div>';
+      return;
+    }
+    el.innerHTML = list.map((a,i) => `
+      <div class="att-row ${i===0&&list.length>0?'new':''}">
+        <div class="att-num">${list.length - i}</div>
+        <div class="att-info">
+          <div class="att-name">${a.name}</div>
+          <div class="att-meta">${a.email||''} · <span style="font-family:monospace;color:var(--accent);font-size:0.72rem">${a.code}</span></div>
+        </div>
+        <div class="att-time">${a.checkedAt||'—'}</div>
+      </div>`).join('');
+  }
+
+  window.doScan = async function() {
+    const raw    = document.getElementById('scan-input').value.trim().toUpperCase();
+    const result = document.getElementById('scan-result');
+    if (!raw) return;
+    if (!selectedEventId) { showResult(result,'warn','⚠ Zgjidhni eventin së pari',''); return; }
+
+    const att = attendees.find(a => a.code === raw);
+
+    if (!att) {
+      showResult(result, 'error', '❌ KOD I PAVLEFSHËM', `Asnjë pjesëmarrës i regjistruar nuk u gjet për kodin:<br><strong>${raw}</strong>`);
+      return;
+    }
+
+    const already = (att.checkedInEvents||[]).includes(selectedEventId);
+    if (already) {
+      showResult(result, 'warn', '⚠ TASHMË I PRANUAR',
+        `<strong>${att.name}</strong> është pranuar tashmë në këtë event.<br>Ky kod nuk mund të përdoret sërish për të njëjtin event.`);
+      return;
+    }
+
+    // ✅ Check in
+    const checkedAt = nowStr();
+    try {
+      await updateDoc(doc(db,'attendees',att.id), {
+        checkedInEvents: arrayUnion(selectedEventId),
+        checkedAt
+      });
+      showResult(result, 'success', '✅ PRANIMI U KRY ME SUKSES',
+        `<strong style="font-size:1.1rem">${att.name}</strong><br>${att.email||''} · ${checkedAt}`);
+    } catch(e) {
+      showResult(result, 'error', '❌ GABIM', e.message);
+    }
+    document.getElementById('scan-input').value = '';
+    document.getElementById('scan-input').focus();
+  };
+
+  function showResult(el, type, title, msg) {
+    el.className = `scan-result ${type}`;
+    el.innerHTML = `<div class="sr-title">${title}</div>${msg?`<div class="sr-msg">${msg}</div>`:''}`;
+    const ms = type==='success' ? 3500 : 5000;
+    setTimeout(()=>{ el.innerHTML=''; el.className='scan-result'; }, ms);
+  }
+
+  document.addEventListener('DOMContentLoaded', ()=>{
+    document.getElementById('scan-input').addEventListener('keydown', e=>{ if(e.key==='Enter') window.doScan(); });
+  });
+</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap');
+:root{--bg:#0a0a0f;--surface:#13131a;--card:#1c1c28;--border:#2a2a3d;--accent:#00e5b4;--accent2:#ff4f6d;--warn:#ffb547;--text:#e8e8f0;--muted:#6b6b8a}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-height:100vh}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:48px 48px;opacity:0.2;pointer-events:none;z-index:0}
+.wrap{position:relative;z-index:1;max-width:680px;margin:0 auto;padding:0 20px 60px}
+header{padding:30px 0 22px;border-bottom:1px solid var(--border);margin-bottom:28px;display:flex;align-items:center;gap:14px}
+.lm{width:40px;height:40px;border:2px solid var(--accent);display:grid;grid-template-columns:1fr 1fr;gap:3px;padding:5px;flex-shrink:0}
+.lm span{background:var(--accent);display:block}
+.lm span:nth-child(2),.lm span:nth-child(3){background:transparent;border:1.5px solid var(--accent)}
+.badge{display:inline-flex;align-items:center;gap:5px;background:rgba(0,229,180,0.1);border:1px solid rgba(0,229,180,0.3);border-radius:20px;padding:3px 9px;font-family:'DM Mono',monospace;font-size:0.67rem;color:var(--accent);margin-left:8px}
+.dot{width:6px;height:6px;background:var(--accent);border-radius:50%;animation:p 1.5s infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:0.4}}
+
+/* Event select */
+.event-select-wrap{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px;margin-bottom:20px}
+.event-select-wrap label{font-size:0.7rem;font-family:'DM Mono',monospace;color:var(--muted);text-transform:uppercase;letter-spacing:0.09em;display:block;margin-bottom:8px}
+select{width:100%;background:var(--surface);border:1.5px solid var(--border);color:var(--text);padding:11px 14px;font-family:'DM Mono',monospace;font-size:0.88rem;border-radius:6px;outline:none;transition:border-color 0.2s;cursor:pointer}
+select:focus{border-color:var(--accent)}
+select option{background:var(--surface)}
+
+/* No event */
+#no-event-msg{text-align:center;padding:48px 20px;color:var(--muted);font-family:'DM Mono',monospace;font-size:0.85rem}
+
+/* Stats */
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;text-align:center}
+.stat-n{font-family:'DM Mono',monospace;font-size:1.8rem;font-weight:500}
+.stat-n.g{color:var(--accent)}.stat-n.o{color:var(--warn)}
+.stat-l{font-size:0.63rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;margin-top:2px}
+
+/* Scanner */
+.scanner-box{background:var(--card);border:2px dashed var(--border);border-radius:10px;padding:32px 24px;text-align:center;margin-bottom:20px;transition:border-color 0.3s}
+.si{font-size:3rem;margin-bottom:10px}
+.sh{color:var(--muted);font-size:0.82rem;margin-bottom:20px;line-height:1.6;font-family:'DM Mono',monospace}
+.code-input{background:var(--surface);border:2px solid var(--border);color:var(--text);padding:15px 18px;font-family:'DM Mono',monospace;font-size:1.25rem;border-radius:6px;outline:none;width:100%;max-width:360px;text-align:center;letter-spacing:0.15em;transition:border-color 0.2s;margin-bottom:14px;display:block;margin-left:auto;margin-right:auto}
+.code-input:focus{border-color:var(--accent)}
+.btn-scan{background:var(--accent);color:#000;border:none;padding:13px 40px;border-radius:6px;font-family:'Syne',sans-serif;font-weight:800;font-size:0.95rem;cursor:pointer;transition:all 0.2s}
+.btn-scan:hover{filter:brightness(1.1);transform:translateY(-1px)}
+
+/* Result */
+.scan-result{border-radius:8px;font-family:'DM Mono',monospace;margin-top:18px;animation:pi 0.3s ease}
+.scan-result.success{background:rgba(0,229,180,0.1);border:1px solid var(--accent);padding:18px;color:var(--accent)}
+.scan-result.error{background:rgba(255,79,109,0.1);border:1px solid var(--accent2);padding:18px;color:var(--accent2)}
+.scan-result.warn{background:rgba(255,181,71,0.1);border:1px solid var(--warn);padding:18px;color:var(--warn)}
+.sr-title{font-size:0.88rem;font-weight:500;margin-bottom:5px}
+.sr-msg{font-size:0.82rem;color:var(--text);line-height:1.6}
+@keyframes pi{from{opacity:0;transform:scale(0.96)}to{opacity:1;transform:scale(1)}}
+
+/* Attendance list */
+.list-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px}
+.list-title{font-size:0.9rem;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:8px;color:var(--muted)}
+.list-title::after{content:'';flex:1;height:1px;background:var(--border)}
+.att-row{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--border);transition:background 0.3s}
+.att-row.new{animation:hl 1.2s ease}
+@keyframes hl{0%{background:rgba(0,229,180,0.08)}100%{background:transparent}}
+.att-row:last-child{border-bottom:none}
+.att-num{font-family:'DM Mono',monospace;font-size:0.75rem;color:var(--muted);width:28px;text-align:right;flex-shrink:0}
+.att-info{flex:1;min-width:0}
+.att-name{font-weight:700;font-size:0.88rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.att-meta{font-size:0.72rem;color:var(--muted);font-family:'DM Mono',monospace;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.att-time{font-family:'DM Mono',monospace;font-size:0.7rem;color:var(--muted);flex-shrink:0;text-align:right}
+.empty-sm{text-align:center;padding:28px;color:var(--muted);font-family:'DM Mono',monospace;font-size:0.8rem}
+
+#scan-section{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="lm"><span></span><span></span><span></span><span></span></div>
+    <div>
+      <h1 style="font-size:1.3rem;font-weight:800;letter-spacing:-0.02em">
+        Konferenca <span class="badge"><span class="dot"></span>SKANER</span>
+      </h1>
+      <p style="font-size:0.74rem;color:var(--muted);font-family:'DM Mono',monospace;margin-top:2px">pranimi i pjesëmarrësve · kohë reale</p>
+    </div>
+  </header>
+
+  <!-- Event selector -->
+  <div class="event-select-wrap">
+    <label>Zgjidhni eventin që po skanoni</label>
+    <select id="event-select" onchange="selectEvent()">
+      <option value="">— Zgjidhni eventin —</option>
+    </select>
+  </div>
+
+  <!-- No event selected -->
+  <div id="no-event-msg">📋 Zgjidhni eventin më sipër për të filluar skanimin.</div>
+
+  <!-- Scan section (shown after event selected) -->
+  <div id="scan-section">
+    <!-- Stats -->
+    <div class="stats">
+      <div class="stat"><div class="stat-n" id="stat-total">—</div><div class="stat-l">Gjithsej</div></div>
+      <div class="stat"><div class="stat-n g" id="stat-checked">—</div><div class="stat-l">Të Pranuar</div></div>
+      <div class="stat"><div class="stat-n o" id="stat-left">—</div><div class="stat-l">Mbetur</div></div>
+    </div>
+
+    <!-- Scanner -->
+    <div class="scanner-box" id="scanner-box">
+      <div class="si">📲</div>
+      <p class="sh">Shkruaj ose skano kodin unik të pjesëmarrësit<br>Shtyp <strong>Enter</strong> ose kliko butonin për të pranuar</p>
+      <input class="code-input" id="scan-input" placeholder="p.sh. KNF-AB3X9Y2Z" oninput="this.value=this.value.toUpperCase()">
+      <button class="btn-scan" onclick="doScan()">✓ Pranoj</button>
+      <div id="scan-result" class="scan-result"></div>
+    </div>
+
+    <!-- Attendance list -->
+    <div class="list-card">
+      <div class="list-title">Pjesëmarrësit e Pranuar</div>
+      <div id="attendance-list"><div class="empty-sm">Asnjë pranim ende.</div></div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

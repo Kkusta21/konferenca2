@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="sq">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Konferenca · Admin</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, collection, addDoc, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion, serverTimestamp }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyDvIs7NNrM_1C7Jb2DWULKiKvCUrtJVzTg",
+    authDomain: "konferenca.firebaseapp.com",
+    projectId: "konferenca",
+    storageBucket: "konferenca.firebasestorage.app",
+    messagingSenderId: "862842008546",
+    appId: "1:862842008546:web:b22caae19c00db52453fbb"
+  };
+
+  const ADMIN_PASS = "20262026";
+
+  window.checkPass = function() {
+    if (document.getElementById('pass-in').value === ADMIN_PASS) {
+      document.getElementById('login').style.display = 'none';
+      document.getElementById('app').style.display   = 'block';
+      initApp();
+    } else {
+      document.getElementById('pass-err').style.display = 'block';
+      document.getElementById('pass-in').value = '';
+      document.getElementById('pass-in').focus();
+    }
+  };
+
+  document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('pass-in').addEventListener('keydown', e => { if(e.key==='Enter') window.checkPass(); });
+  });
+
+  let events=[], attendees=[], db;
+
+  function fmtDate(d,t) {
+    if(!d) return '—';
+    try {
+      const dt = new Date(d+'T'+(t||'00:00'));
+      return dt.toLocaleDateString('sq-AL',{month:'short',day:'numeric',year:'numeric'})+(t?' '+dt.toLocaleTimeString('sq-AL',{hour:'2-digit',minute:'2-digit'}):'');
+    } catch { return d; }
+  }
+  function toast(msg,type='ok') {
+    const t=document.createElement('div'); t.className=`toast t-${type}`; t.textContent=msg;
+    document.getElementById('toasts').appendChild(t);
+    setTimeout(()=>t.classList.add('show'),10);
+    setTimeout(()=>{ t.classList.remove('show'); setTimeout(()=>t.remove(),400); },3500);
+  }
+  function uid() {
+    const c='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s='KNF-';
+    for(let i=0;i<8;i++) s+=c[Math.floor(Math.random()*c.length)]; return s;
+  }
+  async function sendEmail(name, email, code) {
+    const res = await fetch('/api/send-email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, email, code })
+    });
+    if (!res.ok) { const e=await res.json(); throw new Error(e.error||'Email dështoi'); }
+  }
+
+  function initApp() {
+    db = getFirestore(initializeApp(firebaseConfig, 'admin'));
+
+    onSnapshot(query(collection(db,'events'),orderBy('createdAt','asc')), snap=>{
+      events=snap.docs.map(d=>({id:d.id,...d.data()}));
+      renderEvents(); renderEventSelects(); renderReports();
+    });
+    onSnapshot(query(collection(db,'attendees'),orderBy('createdAt','asc')), snap=>{
+      attendees=snap.docs.map(d=>({id:d.id,...d.data()}));
+      renderAttendees(); renderEvents(); renderReports();
+    });
+
+    window.addEvent = async function() {
+      const name=document.getElementById('ev-name').value.trim();
+      const loc =document.getElementById('ev-loc').value.trim();
+      const date=document.getElementById('ev-date').value;
+      const time=document.getElementById('ev-time').value;
+      if(!name){toast('Emri i eventit është i detyrueshëm','err');return;}
+      const btn=document.getElementById('btn-ev'); btn.disabled=true; btn.textContent='Duke ruajtur…';
+      try {
+        await addDoc(collection(db,'events'),{name,loc,date,time,createdAt:serverTimestamp()});
+        ['ev-name','ev-loc','ev-date','ev-time'].forEach(id=>document.getElementById(id).value='');
+        toast('Eventi u shtua ✓','ok');
+      } catch(e){toast('Gabim: '+e.message,'err');}
+      btn.disabled=false; btn.textContent='+ Shto Event';
+    };
+
+    window.manualRegister = async function() {
+      const name =document.getElementById('man-name').value.trim();
+      const email=document.getElementById('man-email').value.trim();
+      if(!name){toast('Emri është i detyrueshëm','err');return;}
+      const code=uid();
+      const btn=document.getElementById('btn-man'); btn.disabled=true; btn.textContent='Duke regjistruar…';
+      try {
+        await addDoc(collection(db,'attendees'),{name,email,code,checkedInEvents:[],createdAt:serverTimestamp()});
+        ['man-name','man-email'].forEach(id=>document.getElementById(id).value='');
+        toast('Pjesëmarrësi u regjistrua ✓','ok');
+        if(email) { await sendEmail(name,email,code); toast(`📧 Email dërguar te ${email}`,'ok'); }
+      } catch(e){toast('Gabim: '+e.message,'err');}
+      btn.disabled=false; btn.textContent='Regjistro & Dërgo QR';
+    };
+
+    window.verifyCode = async function() {
+      const code    = document.getElementById('verify-code').value.trim().toUpperCase();
+      const eventId = document.getElementById('verify-event').value;
+      const el      = document.getElementById('verify-result');
+      if(!code){toast('Shkruaj kodin','err');return;}
+      const att = attendees.find(a=>a.code===code);
+      if(!att){
+        el.className='vresult error';
+        el.innerHTML=`<div class="vr-title">❌ KOD I PAVLEFSHËM</div><div class="vr-body">Asnjë pjesëmarrës nuk u gjet për kodin <strong>${code}</strong></div>`;
+        return;
+      }
+      const alreadyIn = eventId && (att.checkedInEvents||[]).includes(eventId);
+      const evtName   = events.find(e=>e.id===eventId)?.name||'—';
+      if(eventId && alreadyIn){
+        el.className='vresult warn';
+        el.innerHTML=`<div class="vr-title">⚠ TASHMË I PRANUAR</div><div class="vr-body"><strong>${att.name}</strong><br>${att.email||''}<br>Pranuar tashmë në: ${evtName}</div>`;
+        return;
+      }
+      el.className='vresult success';
+      const btn = eventId ? `<button class="btn-ci" onclick="manualCheckin('${att.id}','${eventId}')">✓ Pranoj Manualisht</button>` : '';
+      el.innerHTML=`<div class="vr-title">✅ KOD I VLEFSHËM</div>
+        <div class="vr-body"><strong>${att.name}</strong><br>${att.email||''}<br>Kodi: <span style="font-family:monospace;color:var(--accent)">${att.code}</span><br>${eventId?'Event: '+evtName:''}</div>
+        ${btn}`;
+    };
+
+    window.manualCheckin = async function(attId, eventId) {
+      try {
+        await updateDoc(doc(db,'attendees',attId),{
+          checkedInEvents:arrayUnion(eventId),
+          checkedAt:new Date().toLocaleTimeString('sq-AL',{hour:'2-digit',minute:'2-digit',second:'2-digit'})
+        });
+        toast('Pranimi manual u krye ✓','ok');
+        document.getElementById('verify-result').innerHTML='';
+        document.getElementById('verify-result').className='vresult';
+        document.getElementById('verify-code').value='';
+      } catch(e){toast('Gabim: '+e.message,'err');}
+    };
+
+    window.renderEvents = function() {
+      const el=document.getElementById('events-list');
+      if(!events.length){el.innerHTML='<div class="empty"><div class="ei">📋</div><p>Asnjë event.</p></div>';return;}
+      el.innerHTML=events.map(e=>{
+        const chk=attendees.filter(a=>(a.checkedInEvents||[]).includes(e.id)).length;
+        return `<div class="ev-item"><div class="ev-dot"></div>
+          <div style="flex:1"><div style="font-weight:700;font-size:0.92rem">${e.name}</div>
+          <div style="font-size:0.73rem;color:var(--muted);font-family:'DM Mono',monospace;margin-top:2px">${e.loc||'—'} · ${fmtDate(e.date,e.time)}</div></div>
+          <div style="text-align:right;margin-left:12px">
+            <div style="font-family:'DM Mono',monospace;font-size:1rem;font-weight:800;color:var(--accent)">${chk}/${attendees.length}</div>
+            <div style="font-size:0.65rem;color:var(--muted)">të pranuar</div>
+          </div></div>`;
+      }).join('');
+    };
+
+    window.renderEventSelects = function() {
+      const o='<option value="">— Zgjidhni eventin (opsional) —</option>'+events.map(e=>`<option value="${e.id}">${e.name}</option>`).join('');
+      document.getElementById('verify-event').innerHTML=o;
+    };
+
+    window.renderAttendees = function() {
+      const tb=document.getElementById('att-tbody');
+      if(!attendees.length){tb.innerHTML='<tr><td colspan="5" style="text-align:center;padding:36px;color:var(--muted);font-family:monospace;font-size:0.8rem">Asnjë pjesëmarrës.</td></tr>';return;}
+      tb.innerHTML=attendees.map(a=>{
+        const evts=(a.checkedInEvents||[]).map(id=>events.find(e=>e.id===id)?.name||'?').join(', ')||'—';
+        return `<tr>
+          <td><strong>${a.name}</strong><br><span style="font-size:0.71rem;color:var(--muted)">${a.email||'—'}</span></td>
+          <td style="font-family:monospace;font-size:0.78rem;color:var(--accent)">${a.code}</td>
+          <td style="font-size:0.75rem;color:var(--muted);max-width:180px">${evts}</td>
+          <td><span class="badge ${(a.checkedInEvents||[]).length?'b-ok':'b-pend'}">${(a.checkedInEvents||[]).length?'✓ '+(a.checkedInEvents.length)+' event':'Asnjë'}</span></td>
+          <td><button class="btn-sm" onclick='showQR("${a.id}")'>QR</button></td>
+        </tr>`;
+      }).join('');
+    };
+
+    window.renderReports = function() {
+      const el=document.getElementById('reports');
+      if(!events.length){el.innerHTML='<div class="empty"><div class="ei">📊</div><p>Asnjë event ende.</p></div>';return;}
+      el.innerHTML=`
+        <div class="srow">
+          <div class="sc"><div class="sn">${events.length}</div><div class="sl">Evente</div></div>
+          <div class="sc"><div class="sn">${attendees.length}</div><div class="sl">Të Regjistruar</div></div>
+          <div class="sc"><div class="sn g">${attendees.filter(a=>(a.checkedInEvents||[]).length>0).length}</div><div class="sl">Kanë Marrë Pjesë</div></div>
+        </div>
+        ${events.map(e=>{
+          const chk=attendees.filter(a=>(a.checkedInEvents||[]).includes(e.id)).length;
+          const pct=attendees.length?Math.round(chk/attendees.length*100):0;
+          return `<div class="card" style="margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <div><div style="font-weight:700">${e.name}</div><div style="font-size:0.72rem;color:var(--muted);font-family:monospace">${e.loc||'—'} · ${fmtDate(e.date,e.time)}</div></div>
+              <div style="text-align:right"><span style="font-family:monospace;font-size:1.1rem;color:var(--accent)">${chk}/${attendees.length}</span><div style="font-size:0.65rem;color:var(--muted)">të pranuar</div></div>
+            </div>
+            <div style="height:6px;background:var(--surface);border-radius:3px;overflow:hidden"><div style="width:${pct}%;height:100%;background:var(--accent);border-radius:3px;transition:width 0.6s"></div></div>
+          </div>`;
+        }).join('')}`;
+    };
+
+    window.showQR = function(id) {
+      const att=attendees.find(a=>a.id===id); if(!att) return;
+      document.getElementById('m-name').textContent=att.name;
+      document.getElementById('m-code').textContent=att.code;
+      const d=document.getElementById('m-qr'); d.innerHTML='';
+      new QRCode(d,{text:att.code,width:185,height:185,colorDark:'#000',colorLight:'#fff',correctLevel:QRCode.CorrectLevel.H});
+      document.getElementById('modal').classList.add('open');
+    };
+  }
+
+  window.closeModal=function(){document.getElementById('modal').classList.remove('open');};
+  window.switchTab=function(n){
+    document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',['events','attendees','verify','reports'][i]===n));
+    document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+    document.getElementById('p-'+n).classList.add('active');
+    if(n==='reports') window.renderReports?.();
+  };
+</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap');
+:root{--bg:#0a0a0f;--surface:#13131a;--card:#1c1c28;--border:#2a2a3d;--accent:#00e5b4;--accent2:#ff4f6d;--warn:#ffb547;--text:#e8e8f0;--muted:#6b6b8a}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-height:100vh}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:48px 48px;opacity:0.2;pointer-events:none;z-index:0}
+#login{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;background:var(--bg)}
+.lbox{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:40px;max-width:340px;width:90%;text-align:center}
+.lm{width:44px;height:44px;border:2px solid var(--accent);display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:6px;margin:0 auto 18px}
+.lm span{background:var(--accent);display:block}.lm span:nth-child(2),.lm span:nth-child(3){background:transparent;border:1.5px solid var(--accent)}
+.lbox h2{font-size:1.2rem;font-weight:800;margin-bottom:4px}.lbox p{font-size:0.77rem;color:var(--muted);font-family:'DM Mono',monospace;margin-bottom:22px}
+.lbox input{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:12px 16px;font-family:'DM Mono',monospace;font-size:1rem;border-radius:4px;outline:none;text-align:center;letter-spacing:0.15em;margin-bottom:10px;transition:border-color 0.2s}
+.lbox input:focus{border-color:var(--accent)}.perr{color:var(--accent2);font-family:'DM Mono',monospace;font-size:0.77rem;margin-bottom:10px;display:none}
+#app{display:none}
+.wrap{position:relative;z-index:1;max-width:1050px;margin:0 auto;padding:0 22px 60px}
+header{padding:32px 0 24px;border-bottom:1px solid var(--border);margin-bottom:30px;display:flex;align-items:center;gap:14px}
+.hlm{width:40px;height:40px;border:2px solid var(--accent);display:grid;grid-template-columns:1fr 1fr;gap:3px;padding:5px;flex-shrink:0}
+.hlm span{background:var(--accent);display:block}.hlm span:nth-child(2),.hlm span:nth-child(3){background:transparent;border:1.5px solid var(--accent)}
+.abadge{display:inline-flex;align-items:center;gap:5px;background:rgba(255,181,71,0.1);border:1px solid rgba(255,181,71,0.3);border-radius:20px;padding:3px 9px;font-family:'DM Mono',monospace;font-size:0.66rem;color:var(--warn);margin-left:8px}
+.lbadge{display:inline-flex;align-items:center;gap:5px;background:rgba(0,229,180,0.1);border:1px solid rgba(0,229,180,0.3);border-radius:20px;padding:3px 9px;font-family:'DM Mono',monospace;font-size:0.66rem;color:var(--accent);margin-left:6px}
+.ldot{width:6px;height:6px;background:var(--accent);border-radius:50%;animation:pp 1.5s infinite}
+@keyframes pp{0%,100%{opacity:1}50%{opacity:0.4}}
+.tabs{display:flex;gap:4px;background:var(--surface);border:1px solid var(--border);padding:4px;border-radius:6px;margin-bottom:28px;width:fit-content;flex-wrap:wrap}
+.tab{padding:7px 18px;border-radius:4px;cursor:pointer;font-family:'DM Mono',monospace;font-size:0.77rem;color:var(--muted);transition:all 0.2s;border:none;background:transparent}
+.tab.active{background:var(--accent);color:#000;font-weight:500}
+.panel{display:none}.panel.active{display:block}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:22px;margin-bottom:14px}
+.stitle{font-size:0.95rem;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.stitle::after{content:'';flex:1;height:1px;background:var(--border)}
+.fg{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:560px){.fg{grid-template-columns:1fr}}
+.field{display:flex;flex-direction:column;gap:6px}
+label{font-size:0.69rem;font-family:'DM Mono',monospace;color:var(--muted);text-transform:uppercase;letter-spacing:0.09em}
+input,select{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:10px 13px;font-family:'DM Mono',monospace;font-size:0.83rem;border-radius:4px;outline:none;transition:border-color 0.2s;width:100%}
+input:focus,select:focus{border-color:var(--accent)}select option{background:var(--surface)}
+.btn{padding:9px 20px;border-radius:4px;border:none;cursor:pointer;font-family:'Syne',sans-serif;font-weight:700;font-size:0.83rem;transition:all 0.2s}
+.bp{background:var(--accent);color:#000}.bp:hover{filter:brightness(1.1);transform:translateY(-1px)}.bp:disabled{opacity:0.5;transform:none;cursor:not-allowed}
+.mt12{margin-top:12px}
+.ev-item{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px 18px;display:flex;align-items:center;gap:14px;margin-bottom:10px;transition:all 0.2s}
+.ev-item:hover{border-color:var(--accent);transform:translateX(2px)}.ev-dot{width:9px;height:9px;border-radius:50%;background:var(--accent);flex-shrink:0}
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:0.8rem}
+thead tr{border-bottom:2px solid var(--border)}
+th{text-align:left;padding:9px 11px;font-family:'DM Mono',monospace;font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em}
+td{padding:11px;border-bottom:1px solid var(--border);vertical-align:middle}
+tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,0.02)}
+.badge{display:inline-flex;align-items:center;padding:3px 9px;border-radius:20px;font-family:'DM Mono',monospace;font-size:0.67rem;font-weight:500}
+.b-ok{background:rgba(0,229,180,0.12);color:var(--accent);border:1px solid rgba(0,229,180,0.25)}
+.b-pend{background:rgba(107,107,138,0.15);color:var(--muted);border:1px solid var(--border)}
+.btn-sm{background:transparent;border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:4px;font-family:'DM Mono',monospace;font-size:0.7rem;cursor:pointer;transition:all 0.2s}
+.btn-sm:hover{border-color:var(--accent);color:var(--accent)}
+.vresult{border-radius:7px;font-family:'DM Mono',monospace;margin-top:14px}
+.vresult.success{background:rgba(0,229,180,0.08);border:1px solid var(--accent);padding:16px;color:var(--accent)}
+.vresult.error{background:rgba(255,79,109,0.08);border:1px solid var(--accent2);padding:16px;color:var(--accent2)}
+.vresult.warn{background:rgba(255,181,71,0.08);border:1px solid var(--warn);padding:16px;color:var(--warn)}
+.vr-title{font-size:0.85rem;font-weight:500;margin-bottom:6px}.vr-body{font-size:0.8rem;color:var(--text);line-height:1.7}
+.btn-ci{display:inline-block;margin-top:10px;background:var(--accent);color:#000;border:none;padding:8px 18px;border-radius:4px;font-family:'Syne',sans-serif;font-weight:700;font-size:0.8rem;cursor:pointer;transition:all 0.2s}
+.btn-ci:hover{filter:brightness(1.1)}
+.srow{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}
+.sc{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px;text-align:center}
+.sn{font-family:'DM Mono',monospace;font-size:1.7rem;font-weight:500}.sn.g{color:var(--accent)}
+.sl{font-size:0.63rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;margin-top:2px}
+.modal-ov{display:none;position:fixed;inset:0;z-index:100;background:rgba(0,0,0,0.8);backdrop-filter:blur(4px);align-items:center;justify-content:center}
+.modal-ov.open{display:flex}
+.modal{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:320px;width:90%;text-align:center;position:relative}
+.mc{position:absolute;top:14px;right:14px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:1.1rem}
+.qrbox{background:#fff;padding:14px;border-radius:8px;display:inline-block;margin:12px 0}
+.mcode{font-family:'DM Mono',monospace;font-size:0.95rem;letter-spacing:0.12em;color:var(--accent);background:var(--surface);padding:7px 14px;border-radius:4px;display:inline-block;margin-bottom:6px}
+.empty{text-align:center;padding:48px 20px;color:var(--muted)}.ei{font-size:2.2rem;margin-bottom:10px}.empty p{font-family:'DM Mono',monospace;font-size:0.78rem}
+#toasts{position:fixed;bottom:20px;right:20px;z-index:999;display:flex;flex-direction:column;gap:7px}
+.toast{background:var(--card);border:1px solid var(--border);color:var(--text);padding:11px 16px;border-radius:6px;font-family:'DM Mono',monospace;font-size:0.78rem;opacity:0;transform:translateY(8px);transition:all 0.3s;max-width:300px}
+.toast.show{opacity:1;transform:translateY(0)}.t-ok{border-color:var(--accent);color:var(--accent)}.t-err{border-color:var(--accent2);color:var(--accent2)}
+</style>
+</head>
+<body>
+<div id="login">
+  <div class="lbox">
+    <div class="lm"><span></span><span></span><span></span><span></span></div>
+    <h2>Panel Administrativ</h2>
+    <p>Konferenca · Aksesi i kufizuar</p>
+    <input type="password" id="pass-in" placeholder="Shkruaj fjalëkalimin…">
+    <p class="perr" id="pass-err">⚠ Fjalëkalim i gabuar.</p>
+    <button class="btn bp" style="width:100%" onclick="checkPass()">Hyr →</button>
+  </div>
+</div>
+<div id="app">
+<div id="toasts"></div>
+<div class="wrap">
+  <header>
+    <div class="hlm"><span></span><span></span><span></span><span></span></div>
+    <div>
+      <h1 style="font-size:1.35rem;font-weight:800;letter-spacing:-0.02em">Konferenca <span class="abadge">⚙ ADMIN</span><span class="lbadge"><span class="ldot"></span>LIVE</span></h1>
+      <p style="font-size:0.74rem;color:var(--muted);font-family:'DM Mono',monospace;margin-top:2px">panel administrativ · menaxhim i plotë</p>
+    </div>
+  </header>
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('events')">Evente</button>
+    <button class="tab" onclick="switchTab('attendees')">Pjesëmarrës</button>
+    <button class="tab" onclick="switchTab('verify')">Verifiko Kod</button>
+    <button class="tab" onclick="switchTab('reports')">Raporte</button>
+  </div>
+  <div class="panel active" id="p-events">
+    <div class="card">
+      <div class="stitle">Shto Event të Ri</div>
+      <div class="fg">
+        <div class="field"><label>Emri i Eventit</label><input id="ev-name" placeholder="p.sh. Fjalimi Hapës"></div>
+        <div class="field"><label>Vendndodhja / Salla</label><input id="ev-loc" placeholder="p.sh. Salla A"></div>
+        <div class="field"><label>Data</label><input id="ev-date" type="date"></div>
+        <div class="field"><label>Ora</label><input id="ev-time" type="time"></div>
+      </div>
+      <div class="mt12"><button class="btn bp" id="btn-ev" onclick="addEvent()">+ Shto Event</button></div>
+    </div>
+    <div class="stitle">Eventet e Konferencës</div>
+    <div id="events-list"><div class="empty"><div class="ei">📋</div><p>Duke ngarkuar…</p></div></div>
+  </div>
+  <div class="panel" id="p-attendees">
+    <div class="card">
+      <div class="stitle">Regjistro Manualisht</div>
+      <div class="fg">
+        <div class="field"><label>Emri i Plotë</label><input id="man-name" placeholder="p.sh. Agim Berisha"></div>
+        <div class="field"><label>Email (opsional)</label><input id="man-email" type="email" placeholder="p.sh. agim@email.com"></div>
+      </div>
+      <div class="mt12"><button class="btn bp" id="btn-man" onclick="manualRegister()">Regjistro & Dërgo QR</button></div>
+    </div>
+    <div class="stitle">Të Gjithë Pjesëmarrësit</div>
+    <div class="card" style="padding:0;overflow:hidden">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Emri</th><th>Kodi</th><th>Eventet</th><th>Statusi</th><th></th></tr></thead>
+          <tbody id="att-tbody"><tr><td colspan="5" style="text-align:center;padding:32px;color:var(--muted);font-family:monospace;font-size:0.8rem">Duke ngarkuar…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="panel" id="p-verify">
+    <div class="card">
+      <div class="stitle">Verifiko ose Pranoj Manualisht</div>
+      <p style="font-size:0.8rem;color:var(--muted);font-family:'DM Mono',monospace;margin-bottom:16px">Kontroll nëse një kod ekziston. Mundësi pranimi manual nëse kodi është i vlefshëm.</p>
+      <div class="fg">
+        <div class="field"><label>Kodi i Pjesëmarrësit</label><input id="verify-code" placeholder="p.sh. KNF-AB3X9Y2Z" oninput="this.value=this.value.toUpperCase()" onkeydown="if(event.key==='Enter')verifyCode()"></div>
+        <div class="field"><label>Event (opsional)</label><select id="verify-event"><option value="">— Zgjidhni eventin —</option></select></div>
+      </div>
+      <div class="mt12"><button class="btn bp" onclick="verifyCode()">🔍 Verifiko Kodin</button></div>
+      <div id="verify-result" class="vresult"></div>
+    </div>
+  </div>
+  <div class="panel" id="p-reports">
+    <div class="stitle">Pasqyra e Prezencës</div>
+    <div id="reports"><div class="empty"><div class="ei">📊</div><p>Duke ngarkuar…</p></div></div>
+  </div>
+</div>
+<div class="modal-ov" id="modal">
+  <div class="modal">
+    <button class="mc" onclick="closeModal()">✕</button>
+    <h3 style="font-size:1rem;font-weight:800;margin-bottom:4px" id="m-name"></h3>
+    <div class="qrbox"><div id="m-qr"></div></div><br>
+    <div class="mcode" id="m-code"></div>
+    <p style="font-size:0.7rem;color:var(--muted);font-family:'DM Mono',monospace;margin:10px 0 16px">Kod personal · i vlefshëm për gjithë konferencën</p>
+    <button class="btn bp" onclick="window.print()">🖨 Printo</button>
+  </div>
+</div>
+</div>
+<script>document.getElementById('modal').addEventListener('click',function(e){if(e.target===this)closeModal();});</script>
+</body>
+</html>

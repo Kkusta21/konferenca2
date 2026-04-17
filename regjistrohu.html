@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="sq">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Konferenca · Regjistrohu</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, collection, addDoc, query, where, getDocs, serverTimestamp }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyDvIs7NNrM_1C7Jb2DWULKiKvCUrtJVzTg",
+    authDomain: "konferenca.firebaseapp.com",
+    projectId: "konferenca",
+    storageBucket: "konferenca.firebasestorage.app",
+    messagingSenderId: "862842008546",
+    appId: "1:862842008546:web:b22caae19c00db52453fbb"
+  };
+
+  const db = getFirestore(initializeApp(firebaseConfig));
+
+  function uid() {
+    const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let s = 'KNF-';
+    for (let i=0;i<8;i++) s += c[Math.floor(Math.random()*c.length)];
+    return s;
+  }
+
+  async function sendEmail(name, email, code) {
+    const res = await fetch('/api/send-email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, email, code })
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Email dështoi');
+    }
+  }
+
+  window.submit = async function() {
+    const name  = document.getElementById('reg-name').value.trim();
+    const email = document.getElementById('reg-email').value.trim();
+    let ok = true;
+    document.getElementById('err-name').style.display  = name  ? 'none' : 'block'; if (!name)  ok = false;
+    document.getElementById('err-email').style.display = email ? 'none' : 'block'; if (!email) ok = false;
+    document.getElementById('err-dup').style.display   = 'none';
+    document.getElementById('err-gen').style.display   = 'none';
+    if (!ok) return;
+
+    const dup = await getDocs(query(collection(db,'attendees'), where('email','==',email)));
+    if (!dup.empty) { document.getElementById('err-dup').style.display='block'; return; }
+
+    const code = uid();
+    const btn  = document.getElementById('btn-reg');
+    btn.disabled = true; btn.textContent = 'Duke regjistruar…';
+
+    try {
+      await addDoc(collection(db,'attendees'), { name, email, code, checkedInEvents:[], createdAt:serverTimestamp() });
+      await sendEmail(name, email, code);
+      document.getElementById('form-wrap').style.display = 'none';
+      document.getElementById('success').style.display   = 'block';
+      document.getElementById('suc-name').textContent = name;
+      document.getElementById('suc-code').textContent = code;
+      const d = document.getElementById('suc-qr'); d.innerHTML = '';
+      new QRCode(d, { text:code, width:190, height:190, colorDark:'#000', colorLight:'#fff', correctLevel:QRCode.CorrectLevel.H });
+    } catch(e) {
+      document.getElementById('err-gen').textContent = 'Gabim: ' + e.message;
+      document.getElementById('err-gen').style.display = 'block';
+      btn.disabled = false; btn.textContent = 'Regjistrohu →';
+    }
+  };
+</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap');
+:root{--bg:#0a0a0f;--surface:#13131a;--card:#1c1c28;--border:#2a2a3d;--accent:#00e5b4;--accent2:#ff4f6d;--text:#e8e8f0;--muted:#6b6b8a}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-height:100vh}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:48px 48px;opacity:0.2;pointer-events:none;z-index:0}
+.wrap{position:relative;z-index:1;max-width:520px;margin:0 auto;padding:0 20px 80px}
+header{padding:52px 0 36px;text-align:center}
+.lm{width:50px;height:50px;border:2px solid var(--accent);display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:7px;margin:0 auto 18px}
+.lm span{background:var(--accent);display:block}
+.lm span:nth-child(2),.lm span:nth-child(3){background:transparent;border:1.5px solid var(--accent)}
+h1{font-size:2rem;font-weight:800;letter-spacing:-0.03em;margin-bottom:8px}
+.sub{color:var(--muted);font-size:0.83rem;font-family:'DM Mono',monospace;line-height:1.7}
+.banner{background:rgba(0,229,180,0.06);border:1px solid rgba(0,229,180,0.2);border-radius:8px;padding:14px 18px;margin-bottom:28px;display:flex;gap:12px;align-items:flex-start;font-family:'DM Mono',monospace;font-size:0.8rem;color:var(--text);line-height:1.6}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:32px;margin-bottom:14px}
+.field{display:flex;flex-direction:column;gap:7px;margin-bottom:20px}
+label{font-size:0.7rem;font-family:'DM Mono',monospace;color:var(--muted);text-transform:uppercase;letter-spacing:0.09em}
+input{background:var(--surface);border:1.5px solid var(--border);color:var(--text);padding:13px 16px;font-family:'DM Mono',monospace;font-size:0.9rem;border-radius:6px;outline:none;transition:border-color 0.2s;width:100%}
+input:focus{border-color:var(--accent)}
+.err{color:var(--accent2);font-size:0.74rem;font-family:'DM Mono',monospace;display:none;margin-top:2px}
+.btn{width:100%;background:var(--accent);color:#000;border:none;padding:15px;border-radius:8px;font-family:'Syne',sans-serif;font-weight:800;font-size:0.95rem;cursor:pointer;transition:all 0.2s;margin-top:18px}
+.btn:hover{filter:brightness(1.1);transform:translateY(-1px)}
+.btn:disabled{opacity:0.6;transform:none;cursor:not-allowed}
+.note{font-size:0.72rem;color:var(--muted);font-family:'DM Mono',monospace;text-align:center;margin-top:10px}
+#success{display:none;text-align:center;padding:16px 0}
+.sicon{font-size:4rem;margin-bottom:14px;animation:pop 0.5s ease}
+@keyframes pop{0%{transform:scale(0)}70%{transform:scale(1.1)}100%{transform:scale(1)}}
+.stitle{font-size:1.5rem;font-weight:800;color:var(--accent);margin-bottom:6px}
+.ssub{color:var(--muted);font-size:0.82rem;margin-bottom:28px;font-family:'DM Mono',monospace;line-height:1.7}
+.scard{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:28px;margin-bottom:14px}
+.qrbox{background:#fff;padding:14px;border-radius:8px;display:inline-block;margin-bottom:18px}
+.sname{font-size:1rem;font-weight:700;margin-bottom:14px}
+.scode{font-family:'DM Mono',monospace;font-size:1.2rem;letter-spacing:0.15em;color:var(--accent);background:var(--surface);border:1px solid rgba(0,229,180,0.3);padding:10px 22px;border-radius:6px;display:inline-block;margin-bottom:18px}
+.snote{font-size:0.75rem;color:var(--muted);font-family:'DM Mono',monospace;line-height:1.8;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px;text-align:left}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="lm"><span></span><span></span><span></span><span></span></div>
+    <h1>Regjistrohu</h1>
+    <p class="sub">Plotëso emrin dhe emailin tënd.<br>Do të marrësh një kod QR unik për gjithë konferencën.</p>
+  </header>
+  <div id="form-wrap">
+    <div class="banner">
+      <span style="font-size:1.2rem;flex-shrink:0">🎫</span>
+      <span>Kodi QR që do të marrësh është i vlefshëm për <strong>të gjitha eventet</strong> e konferencës. Nuk duhet të regjistrohesh për çdo event.</span>
+    </div>
+    <div class="card">
+      <div class="field">
+        <label>Emri i Plotë</label>
+        <input id="reg-name" type="text" placeholder="p.sh. Agim Berisha" autocomplete="name">
+        <p class="err" id="err-name">⚠ Emri është i detyrueshëm.</p>
+      </div>
+      <div class="field" style="margin-bottom:0">
+        <label>Adresa Email</label>
+        <input id="reg-email" type="email" placeholder="p.sh. agim@email.com" autocomplete="email">
+        <p class="err" id="err-email">⚠ Email-i është i detyrueshëm.</p>
+      </div>
+      <p class="err" id="err-dup" style="margin-top:10px">⚠ Ky email është regjistruar tashmë. Kontrolloni emailin tuaj.</p>
+      <p class="err" id="err-gen" style="margin-top:10px"></p>
+      <button class="btn" id="btn-reg" onclick="submit()">Regjistrohu & Merr Kodin QR →</button>
+    </div>
+    <p class="note">Pas regjistrimit do të merrni kodin QR direkt në email.</p>
+  </div>
+  <div id="success">
+    <div class="sicon">🎉</div>
+    <div class="stitle">Regjistrimi u krye!</div>
+    <div class="ssub">Kodi QR u dërgua në emailin tuaj.<br>Ruajeni — do t'ju duhet në çdo event.</div>
+    <div class="scard">
+      <div class="sname" id="suc-name"></div>
+      <div class="qrbox"><div id="suc-qr"></div></div><br>
+      <div class="scode" id="suc-code"></div>
+      <div class="snote">📌 Mbajeni këtë kod gjatë gjithë konferencës.<br>✅ Do të skanohet në hyrje të çdo eventi.<br>⚠️ Mos e ndani me të tjerët — kodi është personal.</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
