@@ -5,9 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Konferenca · Admin</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-  import { getFirestore, collection, addDoc, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion, serverTimestamp }
+  import { getFirestore, collection, addDoc, onSnapshot, doc, updateDoc, deleteDoc, query, orderBy, getDocs, where, serverTimestamp }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
   const firebaseConfig = {
@@ -19,25 +20,16 @@
     appId: "1:862842008546:web:b22caae19c00db52453fbb"
   };
 
-  const ADMIN_PASS = "20262026";
+  // First-boot admin password. If no admin user exists in Firestore, this bootstraps one.
+  // You can change it later from the panel.
+  const BOOTSTRAP_ADMIN_USER = "admin";
+  const BOOTSTRAP_ADMIN_PASS = "20262026";
+  const SESSION_KEY = 'knf_admin_session';
+  const MIN_MINUTES = 10;
 
-  window.checkPass = function() {
-    if (document.getElementById('pass-in').value === ADMIN_PASS) {
-      document.getElementById('login').style.display = 'none';
-      document.getElementById('app').style.display   = 'block';
-      initApp();
-    } else {
-      document.getElementById('pass-err').style.display = 'block';
-      document.getElementById('pass-in').value = '';
-      document.getElementById('pass-in').focus();
-    }
-  };
+  const db = getFirestore(initializeApp(firebaseConfig, 'admin'));
 
-  document.addEventListener('DOMContentLoaded', () => {
-    document.getElementById('pass-in').addEventListener('keydown', e => { if(e.key==='Enter') window.checkPass(); });
-  });
-
-  let events=[], attendees=[], db;
+  let events=[], attendees=[], users=[], currentAdmin=null;
 
   function fmtDate(d,t) {
     if(!d) return '—';
@@ -56,6 +48,10 @@
     const c='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s='KNF-';
     for(let i=0;i<8;i++) s+=c[Math.floor(Math.random()*c.length)]; return s;
   }
+  function randomPass(len=10) {
+    const c='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+    let s=''; for(let i=0;i<len;i++) s+=c[Math.floor(Math.random()*c.length)]; return s;
+  }
   async function sendEmail(name, email, code) {
     const res = await fetch('/api/send-email', {
       method: 'POST',
@@ -65,9 +61,69 @@
     if (!res.ok) { const e=await res.json(); throw new Error(e.error||'Email dështoi'); }
   }
 
-  function initApp() {
-    db = getFirestore(initializeApp(firebaseConfig, 'admin'));
+  // ========== LOGIN ==========
+  async function tryAdminLogin(username, password) {
+    // Check users collection for an admin with matching creds
+    const q = query(collection(db,'users'), where('username','==',username), where('role','==','admin'));
+    const snap = await getDocs(q);
+    if (!snap.empty) {
+      const u = snap.docs[0];
+      const data = u.data();
+      if (data.password === password && data.active !== false) return { id: u.id, ...data };
+      return null;
+    }
+    // Bootstrap: if no admin exists at all and the bootstrap creds match, create one
+    const anyAdmin = await getDocs(query(collection(db,'users'), where('role','==','admin')));
+    if (anyAdmin.empty && username === BOOTSTRAP_ADMIN_USER && password === BOOTSTRAP_ADMIN_PASS) {
+      const ref = await addDoc(collection(db,'users'), {
+        username: BOOTSTRAP_ADMIN_USER,
+        password: BOOTSTRAP_ADMIN_PASS,
+        displayName: 'Administrator',
+        role: 'admin',
+        active: true,
+        createdAt: serverTimestamp()
+      });
+      return { id: ref.id, username, password, role:'admin', displayName:'Administrator' };
+    }
+    return null;
+  }
 
+  window.doAdminLogin = async function() {
+    const u = document.getElementById('a-login-user').value.trim();
+    const p = document.getElementById('a-login-pass').value;
+    const err = document.getElementById('a-login-err');
+    err.style.display = 'none';
+    if (!u || !p) { err.textContent='⚠ Plotëso fushat'; err.style.display='block'; return; }
+    const btn = document.getElementById('btn-a-login');
+    btn.disabled = true; btn.textContent = 'Duke hyrë…';
+    try {
+      const user = await tryAdminLogin(u, p);
+      if (!user) {
+        err.textContent = '⚠ Emri i përdoruesit ose fjalëkalimi është i gabuar.';
+        err.style.display = 'block';
+        btn.disabled = false; btn.textContent = 'Hyr →';
+        return;
+      }
+      currentAdmin = user;
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify({ username:user.username }));
+      document.getElementById('login').style.display = 'none';
+      document.getElementById('app').style.display = 'block';
+      document.getElementById('admin-name').textContent = user.displayName || user.username;
+      initApp();
+    } catch(e) {
+      err.textContent = '⚠ Gabim: ' + e.message;
+      err.style.display = 'block';
+      btn.disabled = false; btn.textContent = 'Hyr →';
+    }
+  };
+
+  window.logoutAdmin = function() {
+    sessionStorage.removeItem(SESSION_KEY);
+    location.reload();
+  };
+
+  // ========== APP ==========
+  function initApp() {
     onSnapshot(query(collection(db,'events'),orderBy('createdAt','asc')), snap=>{
       events=snap.docs.map(d=>({id:d.id,...d.data()}));
       renderEvents(); renderEventSelects(); renderReports();
@@ -75,6 +131,10 @@
     onSnapshot(query(collection(db,'attendees'),orderBy('createdAt','asc')), snap=>{
       attendees=snap.docs.map(d=>({id:d.id,...d.data()}));
       renderAttendees(); renderEvents(); renderReports();
+    });
+    onSnapshot(collection(db,'users'), snap=>{
+      users = snap.docs.map(d=>({id:d.id,...d.data()}));
+      renderUsers();
     });
 
     window.addEvent = async function() {
@@ -99,7 +159,7 @@
       const code=uid();
       const btn=document.getElementById('btn-man'); btn.disabled=true; btn.textContent='Duke regjistruar…';
       try {
-        await addDoc(collection(db,'attendees'),{name,email,code,checkedInEvents:[],createdAt:serverTimestamp()});
+        await addDoc(collection(db,'attendees'),{name,email,code,attendance:{},createdAt:serverTimestamp()});
         ['man-name','man-email'].forEach(id=>document.getElementById(id).value='');
         toast('Pjesëmarrësi u regjistrua ✓','ok');
         if(email) { await sendEmail(name,email,code); toast(`📧 Email dërguar te ${email}`,'ok'); }
@@ -118,44 +178,132 @@
         el.innerHTML=`<div class="vr-title">❌ KOD I PAVLEFSHËM</div><div class="vr-body">Asnjë pjesëmarrës nuk u gjet për kodin <strong>${code}</strong></div>`;
         return;
       }
-      const alreadyIn = eventId && (att.checkedInEvents||[]).includes(eventId);
-      const evtName   = events.find(e=>e.id===eventId)?.name||'—';
-      if(eventId && alreadyIn){
-        el.className='vresult warn';
-        el.innerHTML=`<div class="vr-title">⚠ TASHMË I PRANUAR</div><div class="vr-body"><strong>${att.name}</strong><br>${att.email||''}<br>Pranuar tashmë në: ${evtName}</div>`;
-        return;
-      }
+      const rec = eventId ? att.attendance?.[eventId] : null;
+      const evtName = events.find(e=>e.id===eventId)?.name||'—';
       el.className='vresult success';
-      const btn = eventId ? `<button class="btn-ci" onclick="manualCheckin('${att.id}','${eventId}')">✓ Pranoj Manualisht</button>` : '';
+      let status = '';
+      if (rec?.checkIn) status += `<br>Check-In: ${rec.checkIn}`;
+      if (rec?.checkOut) status += `<br>Check-Out: ${rec.checkOut}`;
+      let actions = '';
+      if (eventId) {
+        if (!rec?.checkIn) {
+          actions = `<button class="btn-ci" onclick="manualCheckin('${att.id}','${eventId}','in')">✓ Check-In Manual</button>`;
+        } else if (!rec?.checkOut) {
+          actions = `<button class="btn-ci" style="background:var(--warn)" onclick="manualCheckin('${att.id}','${eventId}','out')">✗ Check-Out Manual</button>`;
+        } else {
+          el.className='vresult warn';
+          el.innerHTML=`<div class="vr-title">⚠ CIKËL I PLOTË</div><div class="vr-body"><strong>${att.name}</strong><br>${att.email||''}<br>Event: ${evtName}${status}<br>Ky event është i përfunduar.</div>`;
+          return;
+        }
+      }
       el.innerHTML=`<div class="vr-title">✅ KOD I VLEFSHËM</div>
-        <div class="vr-body"><strong>${att.name}</strong><br>${att.email||''}<br>Kodi: <span style="font-family:monospace;color:var(--accent)">${att.code}</span><br>${eventId?'Event: '+evtName:''}</div>
-        ${btn}`;
+        <div class="vr-body"><strong>${att.name}</strong><br>${att.email||''}<br>Kodi: <span style="font-family:monospace;color:var(--accent)">${att.code}</span>${eventId?'<br>Event: '+evtName+status:''}</div>
+        ${actions}`;
     };
 
-    window.manualCheckin = async function(attId, eventId) {
+    window.manualCheckin = async function(attId, eventId, which) {
+      const ts = new Date().toLocaleTimeString('sq-AL',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
       try {
-        await updateDoc(doc(db,'attendees',attId),{
-          checkedInEvents:arrayUnion(eventId),
-          checkedAt:new Date().toLocaleTimeString('sq-AL',{hour:'2-digit',minute:'2-digit',second:'2-digit'})
-        });
-        toast('Pranimi manual u krye ✓','ok');
+        if (which === 'in') {
+          await updateDoc(doc(db,'attendees',attId),{
+            [`attendance.${eventId}.checkIn`]: ts,
+            [`attendance.${eventId}.checkInAt`]: serverTimestamp(),
+            [`attendance.${eventId}.checkInBy`]: currentAdmin.username+' (admin)'
+          });
+          toast('Check-In manual u krye ✓','ok');
+        } else {
+          await updateDoc(doc(db,'attendees',attId),{
+            [`attendance.${eventId}.checkOut`]: ts,
+            [`attendance.${eventId}.checkOutAt`]: serverTimestamp(),
+            [`attendance.${eventId}.checkOutBy`]: currentAdmin.username+' (admin)'
+          });
+          toast('Check-Out manual u krye ✓','ok');
+        }
         document.getElementById('verify-result').innerHTML='';
         document.getElementById('verify-result').className='vresult';
         document.getElementById('verify-code').value='';
       } catch(e){toast('Gabim: '+e.message,'err');}
     };
 
+    // ===== SCANNER USERS =====
+    window.addScanner = async function() {
+      const username = document.getElementById('sc-user').value.trim().toLowerCase();
+      const displayName = document.getElementById('sc-name').value.trim();
+      let password = document.getElementById('sc-pass').value.trim();
+      if (!username) { toast('Emri i përdoruesit i detyrueshëm','err'); return; }
+      if (!/^[a-z0-9_]{3,20}$/.test(username)) { toast('Username: 3-20 shkronja të vogla/numra/_','err'); return; }
+      if (!password) password = randomPass(10);
+      const scanners = users.filter(u => u.role === 'scanner');
+      if (scanners.length >= 20) { toast('Limit 20 skanerë i arritur','err'); return; }
+      if (users.some(u => u.username === username)) { toast('Ky username ekziston tashmë','err'); return; }
+      const btn = document.getElementById('btn-sc'); btn.disabled=true; btn.textContent='Duke shtuar…';
+      try {
+        await addDoc(collection(db,'users'), {
+          username, password,
+          displayName: displayName || username,
+          role: 'scanner', active: true,
+          createdAt: serverTimestamp(),
+          createdBy: currentAdmin.username
+        });
+        ['sc-user','sc-name','sc-pass'].forEach(id=>document.getElementById(id).value='');
+        toast(`Skaneri ${username} u krijua · pass: ${password}`,'ok');
+      } catch(e) { toast('Gabim: '+e.message,'err'); }
+      btn.disabled=false; btn.textContent='+ Shto Skaner';
+    };
+
+    window.toggleScanner = async function(id, active) {
+      try {
+        await updateDoc(doc(db,'users',id), { active: !active });
+        toast(!active ? 'Aktivizuar ✓' : 'Çaktivizuar','ok');
+      } catch(e) { toast('Gabim: '+e.message,'err'); }
+    };
+
+    window.resetScannerPass = async function(id, username) {
+      const newPass = randomPass(10);
+      if (!confirm(`Reset fjalëkalimin për ${username}?\nI riu do të jetë: ${newPass}`)) return;
+      try {
+        await updateDoc(doc(db,'users',id), { password: newPass });
+        toast(`Fjalëkalim i ri për ${username}: ${newPass}`,'ok');
+      } catch(e) { toast('Gabim: '+e.message,'err'); }
+    };
+
+    window.deleteScanner = async function(id, username) {
+      if (!confirm(`Fshi skanerin ${username}?`)) return;
+      try {
+        await deleteDoc(doc(db,'users',id));
+        toast('Skaneri u fshi','ok');
+      } catch(e) { toast('Gabim: '+e.message,'err'); }
+    };
+
+    window.changeAdminPass = async function() {
+      const oldP = document.getElementById('adm-old').value;
+      const newP = document.getElementById('adm-new').value;
+      const newP2 = document.getElementById('adm-new2').value;
+      if (!oldP || !newP) { toast('Plotëso fushat','err'); return; }
+      if (newP !== newP2) { toast('Fjalëkalimet nuk përputhen','err'); return; }
+      if (newP.length < 6) { toast('Min 6 karaktere','err'); return; }
+      if (oldP !== currentAdmin.password) { toast('Fjalëkalimi aktual gabim','err'); return; }
+      try {
+        await updateDoc(doc(db,'users',currentAdmin.id), { password: newP });
+        currentAdmin.password = newP;
+        ['adm-old','adm-new','adm-new2'].forEach(id=>document.getElementById(id).value='');
+        toast('Fjalëkalimi u ndryshua ✓','ok');
+      } catch(e) { toast('Gabim: '+e.message,'err'); }
+    };
+
+    // ===== RENDERERS =====
     window.renderEvents = function() {
       const el=document.getElementById('events-list');
       if(!events.length){el.innerHTML='<div class="empty"><div class="ei">📋</div><p>Asnjë event.</p></div>';return;}
       el.innerHTML=events.map(e=>{
-        const chk=attendees.filter(a=>(a.checkedInEvents||[]).includes(e.id)).length;
+        const inC = attendees.filter(a => a.attendance?.[e.id]?.checkIn).length;
+        const outC = attendees.filter(a => a.attendance?.[e.id]?.checkOut).length;
         return `<div class="ev-item"><div class="ev-dot"></div>
           <div style="flex:1"><div style="font-weight:700;font-size:0.92rem">${e.name}</div>
           <div style="font-size:0.73rem;color:var(--muted);font-family:'DM Mono',monospace;margin-top:2px">${e.loc||'—'} · ${fmtDate(e.date,e.time)}</div></div>
           <div style="text-align:right;margin-left:12px">
-            <div style="font-family:'DM Mono',monospace;font-size:1rem;font-weight:800;color:var(--accent)">${chk}/${attendees.length}</div>
-            <div style="font-size:0.65rem;color:var(--muted)">të pranuar</div>
+            <div style="font-family:'DM Mono',monospace;font-size:0.85rem"><span style="color:var(--accent)">${inC} in</span> · <span style="color:var(--warn)">${outC} out</span></div>
+            <div style="font-size:0.65rem;color:var(--muted)">nga ${attendees.length}</div>
           </div></div>`;
       }).join('');
     };
@@ -169,33 +317,65 @@
       const tb=document.getElementById('att-tbody');
       if(!attendees.length){tb.innerHTML='<tr><td colspan="5" style="text-align:center;padding:36px;color:var(--muted);font-family:monospace;font-size:0.8rem">Asnjë pjesëmarrës.</td></tr>';return;}
       tb.innerHTML=attendees.map(a=>{
-        const evts=(a.checkedInEvents||[]).map(id=>events.find(e=>e.id===id)?.name||'?').join(', ')||'—';
+        const att = a.attendance || {};
+        const eventList = Object.keys(att).map(eid => {
+          const rec = att[eid];
+          const e = events.find(ev=>ev.id===eid);
+          const name = e?.name || '?';
+          const times = `${rec.checkIn||'—'}${rec.checkOut?' → '+rec.checkOut:''}`;
+          return `${name} <span style="color:var(--muted)">(${times})</span>`;
+        }).join('<br>') || '—';
+        const count = Object.keys(att).filter(eid => att[eid].checkIn).length;
         return `<tr>
           <td><strong>${a.name}</strong><br><span style="font-size:0.71rem;color:var(--muted)">${a.email||'—'}</span></td>
           <td style="font-family:monospace;font-size:0.78rem;color:var(--accent)">${a.code}</td>
-          <td style="font-size:0.75rem;color:var(--muted);max-width:180px">${evts}</td>
-          <td><span class="badge ${(a.checkedInEvents||[]).length?'b-ok':'b-pend'}">${(a.checkedInEvents||[]).length?'✓ '+(a.checkedInEvents.length)+' event':'Asnjë'}</span></td>
+          <td style="font-size:0.72rem;color:var(--muted);max-width:240px;line-height:1.6">${eventList}</td>
+          <td><span class="badge ${count?'b-ok':'b-pend'}">${count?'✓ '+count+' event':'Asnjë'}</span></td>
           <td><button class="btn-sm" onclick='showQR("${a.id}")'>QR</button></td>
         </tr>`;
       }).join('');
     };
 
+    window.renderUsers = function() {
+      const el = document.getElementById('users-list');
+      const scanners = users.filter(u => u.role === 'scanner');
+      document.getElementById('scanner-count').textContent = `${scanners.length}/20`;
+      if (!scanners.length) { el.innerHTML='<div class="empty"><div class="ei">👥</div><p>Asnjë skaner ende.</p></div>'; return; }
+      el.innerHTML = scanners.map(u => `
+        <div class="user-row ${u.active===false?'inactive':''}">
+          <div style="flex:1;min-width:0">
+            <div style="font-weight:700;font-size:0.9rem">${u.displayName||u.username} ${u.active===false?'<span style="color:var(--accent2);font-size:0.7rem">· ÇAKTIVIZUAR</span>':''}</div>
+            <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:var(--muted);margin-top:2px">@${u.username} · pass: <span style="color:var(--accent)">${u.password}</span></div>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="btn-sm" onclick="toggleScanner('${u.id}',${u.active!==false})">${u.active===false?'Aktivizo':'Çaktivizo'}</button>
+            <button class="btn-sm" onclick="resetScannerPass('${u.id}','${u.username}')">Reset Pass</button>
+            <button class="btn-sm btn-del" onclick="deleteScanner('${u.id}','${u.username}')">Fshi</button>
+          </div>
+        </div>`).join('');
+    };
+
     window.renderReports = function() {
       const el=document.getElementById('reports');
       if(!events.length){el.innerHTML='<div class="empty"><div class="ei">📊</div><p>Asnjë event ende.</p></div>';return;}
+      const anyCheckedIn = attendees.filter(a => Object.keys(a.attendance||{}).some(eid => a.attendance[eid].checkIn)).length;
       el.innerHTML=`
         <div class="srow">
           <div class="sc"><div class="sn">${events.length}</div><div class="sl">Evente</div></div>
           <div class="sc"><div class="sn">${attendees.length}</div><div class="sl">Të Regjistruar</div></div>
-          <div class="sc"><div class="sn g">${attendees.filter(a=>(a.checkedInEvents||[]).length>0).length}</div><div class="sl">Kanë Marrë Pjesë</div></div>
+          <div class="sc"><div class="sn g">${anyCheckedIn}</div><div class="sl">Kanë Marrë Pjesë</div></div>
         </div>
         ${events.map(e=>{
-          const chk=attendees.filter(a=>(a.checkedInEvents||[]).includes(e.id)).length;
-          const pct=attendees.length?Math.round(chk/attendees.length*100):0;
+          const inC = attendees.filter(a => a.attendance?.[e.id]?.checkIn).length;
+          const outC = attendees.filter(a => a.attendance?.[e.id]?.checkOut).length;
+          const pct = attendees.length?Math.round(inC/attendees.length*100):0;
           return `<div class="card" style="margin-bottom:10px">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
               <div><div style="font-weight:700">${e.name}</div><div style="font-size:0.72rem;color:var(--muted);font-family:monospace">${e.loc||'—'} · ${fmtDate(e.date,e.time)}</div></div>
-              <div style="text-align:right"><span style="font-family:monospace;font-size:1.1rem;color:var(--accent)">${chk}/${attendees.length}</span><div style="font-size:0.65rem;color:var(--muted)">të pranuar</div></div>
+              <div style="text-align:right">
+                <div style="font-family:monospace;font-size:0.9rem"><span style="color:var(--accent)">${inC} in</span> / <span style="color:var(--warn)">${outC} out</span></div>
+                <div style="font-size:0.65rem;color:var(--muted)">nga ${attendees.length}</div>
+              </div>
             </div>
             <div style="height:6px;background:var(--surface);border-radius:3px;overflow:hidden"><div style="width:${pct}%;height:100%;background:var(--accent);border-radius:3px;transition:width 0.6s"></div></div>
           </div>`;
@@ -210,15 +390,89 @@
       new QRCode(d,{text:att.code,width:185,height:185,colorDark:'#000',colorLight:'#fff',correctLevel:QRCode.CorrectLevel.H});
       document.getElementById('modal').classList.add('open');
     };
+
+    // ===== EXCEL EXPORT =====
+    window.exportExcel = function() {
+      if (!events.length) { toast('Asnjë event','err'); return; }
+      const byDay = {};
+      for (const evt of events) {
+        const dayKey = evt.date || 'Pa datë';
+        if (!byDay[dayKey]) byDay[dayKey] = [];
+        for (const a of attendees) {
+          const rec = a.attendance?.[evt.id];
+          if (!rec?.checkIn) continue;
+          let duration = '';
+          if (rec.checkInAt?.seconds && rec.checkOutAt?.seconds) {
+            const mins = Math.round((rec.checkOutAt.seconds - rec.checkInAt.seconds)/60);
+            duration = `${Math.floor(mins/60)}h ${mins%60}m`;
+          }
+          byDay[dayKey].push({
+            'Emri': a.name,
+            'Email': a.email || '',
+            'Kodi': a.code,
+            'Eventi': evt.name,
+            'Vendi': evt.loc || '',
+            'Data': evt.date || '',
+            'Ora e Eventit': evt.time || '',
+            'Check-In': rec.checkIn || '',
+            'Check-Out': rec.checkOut || '',
+            'Kohëzgjatja': duration,
+            'Pranuar Nga': rec.checkInBy || '',
+            'Dalje Nga': rec.checkOutBy || ''
+          });
+        }
+      }
+      const wb = XLSX.utils.book_new();
+      const days = Object.keys(byDay).sort();
+      if (!days.length || days.every(d => !byDay[d].length)) {
+        toast('Asnjë të dhënë për eksportim','err'); return;
+      }
+      for (const day of days) {
+        if (!byDay[day].length) continue;
+        const ws = XLSX.utils.json_to_sheet(byDay[day]);
+        ws['!cols'] = [
+          {wch:22},{wch:28},{wch:14},{wch:24},{wch:16},{wch:12},{wch:10},
+          {wch:10},{wch:10},{wch:12},{wch:18},{wch:18}
+        ];
+        const sheetName = (day === 'Pa datë' ? 'Pa datë' : day).slice(0,31);
+        XLSX.utils.book_append_sheet(wb, ws, sheetName);
+      }
+      const stamp = new Date().toISOString().slice(0,16).replace(/[:T]/g,'-');
+      XLSX.writeFile(wb, `konferenca_prania_${stamp}.xlsx`);
+      toast('Excel u shkarkua ✓','ok');
+    };
   }
 
   window.closeModal=function(){document.getElementById('modal').classList.remove('open');};
   window.switchTab=function(n){
-    document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',['events','attendees','verify','reports'][i]===n));
+    const tabs = ['events','attendees','verify','users','reports'];
+    document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active', tabs[i]===n));
     document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
     document.getElementById('p-'+n).classList.add('active');
-    if(n==='reports') window.renderReports?.();
   };
+
+  document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('a-login-pass').addEventListener('keydown', e => { if(e.key==='Enter') window.doAdminLogin(); });
+    document.getElementById('a-login-user').addEventListener('keydown', e => { if(e.key==='Enter') document.getElementById('a-login-pass').focus(); });
+    // Auto-session
+    const saved = sessionStorage.getItem(SESSION_KEY);
+    if (saved) {
+      try {
+        const s = JSON.parse(saved);
+        getDocs(query(collection(db,'users'), where('username','==',s.username), where('role','==','admin'))).then(snap => {
+          if (!snap.empty && snap.docs[0].data().active !== false) {
+            currentAdmin = { id: snap.docs[0].id, ...snap.docs[0].data() };
+            document.getElementById('login').style.display='none';
+            document.getElementById('app').style.display='block';
+            document.getElementById('admin-name').textContent = currentAdmin.displayName || currentAdmin.username;
+            initApp();
+          } else {
+            sessionStorage.removeItem(SESSION_KEY);
+          }
+        });
+      } catch(e) { sessionStorage.removeItem(SESSION_KEY); }
+    }
+  });
 </script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap');
@@ -227,21 +481,33 @@
 body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-height:100vh}
 body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:48px 48px;opacity:0.2;pointer-events:none;z-index:0}
 #login{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;background:var(--bg)}
-.lbox{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:40px;max-width:340px;width:90%;text-align:center}
+.lbox{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:40px;max-width:360px;width:90%;text-align:center;position:relative;z-index:1}
 .lm{width:44px;height:44px;border:2px solid var(--accent);display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:6px;margin:0 auto 18px}
 .lm span{background:var(--accent);display:block}.lm span:nth-child(2),.lm span:nth-child(3){background:transparent;border:1.5px solid var(--accent)}
-.lbox h2{font-size:1.2rem;font-weight:800;margin-bottom:4px}.lbox p{font-size:0.77rem;color:var(--muted);font-family:'DM Mono',monospace;margin-bottom:22px}
-.lbox input{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:12px 16px;font-family:'DM Mono',monospace;font-size:1rem;border-radius:4px;outline:none;text-align:center;letter-spacing:0.15em;margin-bottom:10px;transition:border-color 0.2s}
-.lbox input:focus{border-color:var(--accent)}.perr{color:var(--accent2);font-family:'DM Mono',monospace;font-size:0.77rem;margin-bottom:10px;display:none}
+.lbox h2{font-size:1.2rem;font-weight:800;margin-bottom:4px}.lbox p.lsub{font-size:0.77rem;color:var(--muted);font-family:'DM Mono',monospace;margin-bottom:22px}
+.lbox input{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:12px 14px;font-family:'DM Mono',monospace;font-size:0.9rem;border-radius:4px;outline:none;margin-bottom:10px;transition:border-color 0.2s}
+.lbox input:focus{border-color:var(--accent)}
+.perr{color:var(--accent2);font-family:'DM Mono',monospace;font-size:0.76rem;margin-bottom:10px;display:none}
+.btn-a-login{width:100%;background:var(--accent);color:#000;border:none;padding:12px;border-radius:4px;font-family:'Syne',sans-serif;font-weight:800;font-size:0.9rem;cursor:pointer;transition:all 0.2s}
+.btn-a-login:hover{filter:brightness(1.1)}.btn-a-login:disabled{opacity:0.5;cursor:not-allowed}
+
 #app{display:none}
 .wrap{position:relative;z-index:1;max-width:1050px;margin:0 auto;padding:0 22px 60px}
-header{padding:32px 0 24px;border-bottom:1px solid var(--border);margin-bottom:30px;display:flex;align-items:center;gap:14px}
+header{padding:28px 0 22px;border-bottom:1px solid var(--border);margin-bottom:26px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 .hlm{width:40px;height:40px;border:2px solid var(--accent);display:grid;grid-template-columns:1fr 1fr;gap:3px;padding:5px;flex-shrink:0}
 .hlm span{background:var(--accent);display:block}.hlm span:nth-child(2),.hlm span:nth-child(3){background:transparent;border:1.5px solid var(--accent)}
 .abadge{display:inline-flex;align-items:center;gap:5px;background:rgba(255,181,71,0.1);border:1px solid rgba(255,181,71,0.3);border-radius:20px;padding:3px 9px;font-family:'DM Mono',monospace;font-size:0.66rem;color:var(--warn);margin-left:8px}
 .lbadge{display:inline-flex;align-items:center;gap:5px;background:rgba(0,229,180,0.1);border:1px solid rgba(0,229,180,0.3);border-radius:20px;padding:3px 9px;font-family:'DM Mono',monospace;font-size:0.66rem;color:var(--accent);margin-left:6px}
 .ldot{width:6px;height:6px;background:var(--accent);border-radius:50%;animation:pp 1.5s infinite}
 @keyframes pp{0%,100%{opacity:1}50%{opacity:0.4}}
+.user-chip{margin-left:auto;display:flex;align-items:center;gap:10px;font-family:'DM Mono',monospace;font-size:0.75rem;color:var(--muted)}
+.btn-logout{background:transparent;border:1px solid var(--border);color:var(--muted);padding:5px 10px;border-radius:4px;font-family:'DM Mono',monospace;font-size:0.7rem;cursor:pointer;transition:all 0.2s}
+.btn-logout:hover{border-color:var(--accent2);color:var(--accent2)}
+
+.topbar{display:flex;justify-content:flex-end;gap:8px;margin-bottom:14px}
+.btn-export{background:var(--surface);border:1px solid var(--accent);color:var(--accent);padding:9px 16px;border-radius:6px;font-family:'DM Mono',monospace;font-size:0.78rem;cursor:pointer;transition:all 0.2s}
+.btn-export:hover{background:var(--accent);color:#000}
+
 .tabs{display:flex;gap:4px;background:var(--surface);border:1px solid var(--border);padding:4px;border-radius:6px;margin-bottom:28px;width:fit-content;flex-wrap:wrap}
 .tab{padding:7px 18px;border-radius:4px;cursor:pointer;font-family:'DM Mono',monospace;font-size:0.77rem;color:var(--muted);transition:all 0.2s;border:none;background:transparent}
 .tab.active{background:var(--accent);color:#000;font-weight:500}
@@ -250,7 +516,8 @@ header{padding:32px 0 24px;border-bottom:1px solid var(--border);margin-bottom:3
 .stitle{font-size:0.95rem;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:8px}
 .stitle::after{content:'';flex:1;height:1px;background:var(--border)}
 .fg{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-@media(max-width:560px){.fg{grid-template-columns:1fr}}
+.fg3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+@media(max-width:560px){.fg,.fg3{grid-template-columns:1fr}}
 .field{display:flex;flex-direction:column;gap:6px}
 label{font-size:0.69rem;font-family:'DM Mono',monospace;color:var(--muted);text-transform:uppercase;letter-spacing:0.09em}
 input,select{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:10px 13px;font-family:'DM Mono',monospace;font-size:0.83rem;border-radius:4px;outline:none;transition:border-color 0.2s;width:100%}
@@ -271,6 +538,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,0.02
 .b-pend{background:rgba(107,107,138,0.15);color:var(--muted);border:1px solid var(--border)}
 .btn-sm{background:transparent;border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:4px;font-family:'DM Mono',monospace;font-size:0.7rem;cursor:pointer;transition:all 0.2s}
 .btn-sm:hover{border-color:var(--accent);color:var(--accent)}
+.btn-sm.btn-del:hover{border-color:var(--accent2);color:var(--accent2)}
 .vresult{border-radius:7px;font-family:'DM Mono',monospace;margin-top:14px}
 .vresult.success{background:rgba(0,229,180,0.08);border:1px solid var(--accent);padding:16px;color:var(--accent)}
 .vresult.error{background:rgba(255,79,109,0.08);border:1px solid var(--accent2);padding:16px;color:var(--accent2)}
@@ -290,21 +558,30 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,0.02
 .mcode{font-family:'DM Mono',monospace;font-size:0.95rem;letter-spacing:0.12em;color:var(--accent);background:var(--surface);padding:7px 14px;border-radius:4px;display:inline-block;margin-bottom:6px}
 .empty{text-align:center;padding:48px 20px;color:var(--muted)}.ei{font-size:2.2rem;margin-bottom:10px}.empty p{font-family:'DM Mono',monospace;font-size:0.78rem}
 #toasts{position:fixed;bottom:20px;right:20px;z-index:999;display:flex;flex-direction:column;gap:7px}
-.toast{background:var(--card);border:1px solid var(--border);color:var(--text);padding:11px 16px;border-radius:6px;font-family:'DM Mono',monospace;font-size:0.78rem;opacity:0;transform:translateY(8px);transition:all 0.3s;max-width:300px}
+.toast{background:var(--card);border:1px solid var(--border);color:var(--text);padding:11px 16px;border-radius:6px;font-family:'DM Mono',monospace;font-size:0.78rem;opacity:0;transform:translateY(8px);transition:all 0.3s;max-width:340px}
 .toast.show{opacity:1;transform:translateY(0)}.t-ok{border-color:var(--accent);color:var(--accent)}.t-err{border-color:var(--accent2);color:var(--accent2)}
+.user-row{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px 16px;display:flex;align-items:center;gap:12px;margin-bottom:8px}
+.user-row.inactive{opacity:0.55}
+.pill{display:inline-block;background:rgba(0,229,180,0.12);color:var(--accent);border:1px solid rgba(0,229,180,0.25);padding:3px 10px;border-radius:20px;font-family:'DM Mono',monospace;font-size:0.7rem;margin-left:10px}
+.info-box{background:rgba(255,181,71,0.06);border:1px solid rgba(255,181,71,0.25);border-radius:6px;padding:12px 14px;font-family:'DM Mono',monospace;font-size:0.75rem;color:var(--warn);margin-bottom:16px;line-height:1.6}
 </style>
 </head>
 <body>
+
+<!-- LOGIN -->
 <div id="login">
   <div class="lbox">
     <div class="lm"><span></span><span></span><span></span><span></span></div>
     <h2>Panel Administrativ</h2>
-    <p>Konferenca · Aksesi i kufizuar</p>
-    <input type="password" id="pass-in" placeholder="Shkruaj fjalëkalimin…">
-    <p class="perr" id="pass-err">⚠ Fjalëkalim i gabuar.</p>
-    <button class="btn bp" style="width:100%" onclick="checkPass()">Hyr →</button>
+    <p class="lsub">Hyrja e sigurtë për administrator</p>
+    <input type="text" id="a-login-user" placeholder="Emri i përdoruesit" autocomplete="username">
+    <input type="password" id="a-login-pass" placeholder="Fjalëkalimi" autocomplete="current-password">
+    <p class="perr" id="a-login-err"></p>
+    <button class="btn-a-login" id="btn-a-login" onclick="doAdminLogin()">Hyr →</button>
   </div>
 </div>
+
+<!-- APP -->
 <div id="app">
 <div id="toasts"></div>
 <div class="wrap">
@@ -314,13 +591,24 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,0.02
       <h1 style="font-size:1.35rem;font-weight:800;letter-spacing:-0.02em">Konferenca <span class="abadge">⚙ ADMIN</span><span class="lbadge"><span class="ldot"></span>LIVE</span></h1>
       <p style="font-size:0.74rem;color:var(--muted);font-family:'DM Mono',monospace;margin-top:2px">panel administrativ · menaxhim i plotë</p>
     </div>
+    <div class="user-chip">
+      <span id="admin-name">—</span>
+      <button class="btn-logout" onclick="logoutAdmin()">Dil</button>
+    </div>
   </header>
+
+  <div class="topbar">
+    <button class="btn-export" onclick="exportExcel()">⬇ Shkarko Excel</button>
+  </div>
+
   <div class="tabs">
     <button class="tab active" onclick="switchTab('events')">Evente</button>
     <button class="tab" onclick="switchTab('attendees')">Pjesëmarrës</button>
     <button class="tab" onclick="switchTab('verify')">Verifiko Kod</button>
+    <button class="tab" onclick="switchTab('users')">Skanerë <span id="scanner-count" class="pill">0/20</span></button>
     <button class="tab" onclick="switchTab('reports')">Raporte</button>
   </div>
+
   <div class="panel active" id="p-events">
     <div class="card">
       <div class="stitle">Shto Event të Ri</div>
@@ -335,6 +623,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,0.02
     <div class="stitle">Eventet e Konferencës</div>
     <div id="events-list"><div class="empty"><div class="ei">📋</div><p>Duke ngarkuar…</p></div></div>
   </div>
+
   <div class="panel" id="p-attendees">
     <div class="card">
       <div class="stitle">Regjistro Manualisht</div>
@@ -348,16 +637,17 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,0.02
     <div class="card" style="padding:0;overflow:hidden">
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Emri</th><th>Kodi</th><th>Eventet</th><th>Statusi</th><th></th></tr></thead>
+          <thead><tr><th>Emri</th><th>Kodi</th><th>Eventet (in → out)</th><th>Statusi</th><th></th></tr></thead>
           <tbody id="att-tbody"><tr><td colspan="5" style="text-align:center;padding:32px;color:var(--muted);font-family:monospace;font-size:0.8rem">Duke ngarkuar…</td></tr></tbody>
         </table>
       </div>
     </div>
   </div>
+
   <div class="panel" id="p-verify">
     <div class="card">
-      <div class="stitle">Verifiko ose Pranoj Manualisht</div>
-      <p style="font-size:0.8rem;color:var(--muted);font-family:'DM Mono',monospace;margin-bottom:16px">Kontroll nëse një kod ekziston. Mundësi pranimi manual nëse kodi është i vlefshëm.</p>
+      <div class="stitle">Verifiko / Pranoj / Dalje Manualisht</div>
+      <p style="font-size:0.8rem;color:var(--muted);font-family:'DM Mono',monospace;margin-bottom:16px">Shkruaj kodin për të verifikuar. Zgjidh eventin për të bërë check-in ose check-out manual.</p>
       <div class="fg">
         <div class="field"><label>Kodi i Pjesëmarrësit</label><input id="verify-code" placeholder="p.sh. KNF-AB3X9Y2Z" oninput="this.value=this.value.toUpperCase()" onkeydown="if(event.key==='Enter')verifyCode()"></div>
         <div class="field"><label>Event (opsional)</label><select id="verify-event"><option value="">— Zgjidhni eventin —</option></select></div>
@@ -366,11 +656,41 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,0.02
       <div id="verify-result" class="vresult"></div>
     </div>
   </div>
+
+  <div class="panel" id="p-users">
+    <div class="info-box">
+      ⚠ Deri në 20 skanerë. Secili hyn në skaner.html me username + fjalëkalim. Nëse lihet bosh, gjenerohet automatikisht.
+    </div>
+    <div class="card">
+      <div class="stitle">Shto Skaner të Ri</div>
+      <div class="fg3">
+        <div class="field"><label>Username (unik)</label><input id="sc-user" placeholder="p.sh. skaner01" oninput="this.value=this.value.toLowerCase().replace(/[^a-z0-9_]/g,'')"></div>
+        <div class="field"><label>Emri për Shfaqje</label><input id="sc-name" placeholder="p.sh. Agim (Salla A)"></div>
+        <div class="field"><label>Fjalëkalim (opsional)</label><input id="sc-pass" placeholder="lëre bosh = gjenero"></div>
+      </div>
+      <div class="mt12"><button class="btn bp" id="btn-sc" onclick="addScanner()">+ Shto Skaner</button></div>
+    </div>
+
+    <div class="stitle">Skanerët Aktivë</div>
+    <div id="users-list"><div class="empty"><div class="ei">👥</div><p>Duke ngarkuar…</p></div></div>
+
+    <div class="card" style="margin-top:24px">
+      <div class="stitle">Ndrysho Fjalëkalimin e Adminit</div>
+      <div class="fg3">
+        <div class="field"><label>Fjalëkalimi Aktual</label><input id="adm-old" type="password"></div>
+        <div class="field"><label>Fjalëkalimi i Ri</label><input id="adm-new" type="password"></div>
+        <div class="field"><label>Konfirmo të Riun</label><input id="adm-new2" type="password"></div>
+      </div>
+      <div class="mt12"><button class="btn bp" onclick="changeAdminPass()">Ndrysho Fjalëkalimin</button></div>
+    </div>
+  </div>
+
   <div class="panel" id="p-reports">
     <div class="stitle">Pasqyra e Prezencës</div>
     <div id="reports"><div class="empty"><div class="ei">📊</div><p>Duke ngarkuar…</p></div></div>
   </div>
 </div>
+
 <div class="modal-ov" id="modal">
   <div class="modal">
     <button class="mc" onclick="closeModal()">✕</button>
@@ -381,6 +701,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,0.02
     <button class="btn bp" onclick="window.print()">🖨 Printo</button>
   </div>
 </div>
+
 </div>
 <script>document.getElementById('modal').addEventListener('click',function(e){if(e.target===this)closeModal();});</script>
 </body>

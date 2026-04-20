@@ -4,9 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Konferenca · Skaner</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-  import { getFirestore, collection, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion }
+  import { getFirestore, collection, onSnapshot, doc, updateDoc, query, orderBy, getDocs, where, serverTimestamp }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
   const firebaseConfig = {
@@ -18,29 +20,84 @@
     appId: "1:862842008546:web:b22caae19c00db52453fbb"
   };
 
+  const MIN_MINUTES = 10;
+  const SESSION_KEY = 'knf_scanner_session';
+
   const db = getFirestore(initializeApp(firebaseConfig));
-  let events = [], attendees = [], selectedEventId = null;
+  let events = [], attendees = [], selectedEventId = null, currentUser = null;
+  let mode = 'checkin'; // 'checkin' or 'checkout'
+  let html5QrCode = null, scanning = false, lastScannedCode = null, lastScanTime = 0;
 
-  function nowStr() { return new Date().toLocaleTimeString('sq-AL',{hour:'2-digit',minute:'2-digit',second:'2-digit'}); }
+  function nowStr() {
+    return new Date().toLocaleTimeString('sq-AL',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  }
+  function nowMs() { return Date.now(); }
 
-  // Load events
-  onSnapshot(query(collection(db,'events'), orderBy('createdAt','asc')), snap => {
-    events = snap.docs.map(d=>({id:d.id,...d.data()}));
-    renderEventSelect();
-  });
+  // ========== LOGIN ==========
+  async function tryLogin(username, password) {
+    const q = query(collection(db,'users'), where('username','==',username), where('role','==','scanner'));
+    const snap = await getDocs(q);
+    if (snap.empty) return null;
+    const u = snap.docs[0];
+    const data = u.data();
+    if (data.password !== password) return null;
+    if (data.active === false) return null;
+    return { id: u.id, ...data };
+  }
 
-  // Load attendees live
-  onSnapshot(query(collection(db,'attendees'), orderBy('createdAt','asc')), snap => {
-    attendees = snap.docs.map(d=>({id:d.id,...d.data()}));
-    if (selectedEventId) { renderAttendanceList(); updateStats(); }
-  });
+  window.doLogin = async function() {
+    const u = document.getElementById('login-user').value.trim();
+    const p = document.getElementById('login-pass').value;
+    const err = document.getElementById('login-err');
+    err.style.display = 'none';
+    if (!u || !p) { err.textContent='⚠ Plotëso fushat'; err.style.display='block'; return; }
+    const btn = document.getElementById('btn-login');
+    btn.disabled = true; btn.textContent = 'Duke hyrë…';
+    try {
+      const user = await tryLogin(u, p);
+      if (!user) {
+        err.textContent = '⚠ Emri i përdoruesit ose fjalëkalimi është i gabuar.';
+        err.style.display = 'block';
+        btn.disabled = false; btn.textContent = 'Hyr →';
+        return;
+      }
+      currentUser = user;
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify({ id:user.id, username:user.username, displayName:user.displayName||user.username }));
+      document.getElementById('login').style.display = 'none';
+      document.getElementById('app').style.display = 'block';
+      document.getElementById('user-badge').textContent = user.displayName || user.username;
+      initApp();
+    } catch(e) {
+      err.textContent = '⚠ Gabim: ' + e.message;
+      err.style.display = 'block';
+      btn.disabled = false; btn.textContent = 'Hyr →';
+    }
+  };
+
+  window.logout = function() {
+    if (html5QrCode && scanning) { html5QrCode.stop().catch(()=>{}); }
+    sessionStorage.removeItem(SESSION_KEY);
+    location.reload();
+  };
+
+  // ========== APP ==========
+  function initApp() {
+    onSnapshot(query(collection(db,'events'), orderBy('createdAt','asc')), snap => {
+      events = snap.docs.map(d=>({id:d.id,...d.data()}));
+      renderEventSelect();
+    });
+    onSnapshot(query(collection(db,'attendees'), orderBy('createdAt','asc')), snap => {
+      attendees = snap.docs.map(d=>({id:d.id,...d.data()}));
+      if (selectedEventId) { renderAttendanceList(); updateStats(); }
+    });
+  }
 
   function renderEventSelect() {
     const sel = document.getElementById('event-select');
     const prev = sel.value;
     sel.innerHTML = '<option value="">— Zgjidhni eventin —</option>' +
       events.map(e=>`<option value="${e.id}">${e.name}</option>`).join('');
-    if (prev) { sel.value = prev; }
+    if (prev) sel.value = prev;
   }
 
   window.selectEvent = function() {
@@ -48,8 +105,8 @@
     const scanArea = document.getElementById('scan-section');
     const emptyMsg = document.getElementById('no-event-msg');
     if (selectedEventId) {
-      scanArea.style.display  = 'block';
-      emptyMsg.style.display  = 'none';
+      scanArea.style.display = 'block';
+      emptyMsg.style.display = 'none';
       renderAttendanceList();
       updateStats();
       document.getElementById('scan-input').focus();
@@ -59,80 +116,261 @@
     }
   };
 
+  window.setMode = function(newMode) {
+    mode = newMode;
+    document.getElementById('btn-mode-in').classList.toggle('active', mode==='checkin');
+    document.getElementById('btn-mode-out').classList.toggle('active', mode==='checkout');
+    document.getElementById('mode-label').textContent = mode==='checkin' ? 'PRANIMI (CHECK-IN)' : 'DALJA (CHECK-OUT)';
+    document.getElementById('btn-action').textContent = mode==='checkin' ? '✓ Pranoj' : '✗ Regjistro Daljen';
+    document.getElementById('btn-action').className = mode==='checkin' ? 'btn-scan' : 'btn-scan btn-out';
+    document.getElementById('scan-input').focus();
+  };
+
   function updateStats() {
     if (!selectedEventId) return;
-    const checked = attendees.filter(a => (a.checkedInEvents||[]).includes(selectedEventId)).length;
-    const total   = attendees.length;
-    document.getElementById('stat-checked').textContent = checked;
-    document.getElementById('stat-total').textContent   = total;
-    document.getElementById('stat-left').textContent    = total - checked;
+    const inCount = attendees.filter(a => a.attendance?.[selectedEventId]?.checkIn).length;
+    const outCount = attendees.filter(a => a.attendance?.[selectedEventId]?.checkOut).length;
+    const total = attendees.length;
+    document.getElementById('stat-total').textContent = total;
+    document.getElementById('stat-in').textContent = inCount;
+    document.getElementById('stat-out').textContent = outCount;
+    document.getElementById('stat-left').textContent = total - inCount;
   }
 
   function renderAttendanceList() {
     if (!selectedEventId) return;
-    const list = attendees.filter(a => (a.checkedInEvents||[]).includes(selectedEventId))
-      .sort((a,b) => (b.checkedAt||'').localeCompare(a.checkedAt||''));
+    const list = attendees
+      .filter(a => a.attendance?.[selectedEventId]?.checkIn)
+      .map(a => ({...a, att: a.attendance[selectedEventId]}))
+      .sort((a,b) => {
+        const ta = a.att.checkOutAt || a.att.checkInAt || 0;
+        const tb = b.att.checkOutAt || b.att.checkInAt || 0;
+        const va = ta?.seconds ? ta.seconds : 0;
+        const vb = tb?.seconds ? tb.seconds : 0;
+        return vb - va;
+      });
     const el = document.getElementById('attendance-list');
     if (!list.length) {
-      el.innerHTML = '<div class="empty-sm">Asnjë pjesëmarrës i pranuar ende për këtë event.</div>';
+      el.innerHTML = '<div class="empty-sm">Asnjë pjesëmarrës ende.</div>';
       return;
     }
-    el.innerHTML = list.map((a,i) => `
-      <div class="att-row ${i===0&&list.length>0?'new':''}">
+    el.innerHTML = list.map((a,i) => {
+      const out = a.att.checkOut;
+      return `
+      <div class="att-row ${i===0?'new':''}">
         <div class="att-num">${list.length - i}</div>
         <div class="att-info">
-          <div class="att-name">${a.name}</div>
-          <div class="att-meta">${a.email||''} · <span style="font-family:monospace;color:var(--accent);font-size:0.72rem">${a.code}</span></div>
+          <div class="att-name">${a.name} ${out?'<span class="chip-out">OUT</span>':'<span class="chip-in">IN</span>'}</div>
+          <div class="att-meta"><span style="font-family:monospace;color:var(--accent);font-size:0.72rem">${a.code}</span> · in: ${a.att.checkIn||'—'}${out?' · out: '+out:''}</div>
         </div>
-        <div class="att-time">${a.checkedAt||'—'}</div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
   }
 
+  // ========== SCAN ACTION ==========
   window.doScan = async function() {
-    const raw    = document.getElementById('scan-input').value.trim().toUpperCase();
-    const result = document.getElementById('scan-result');
+    const raw = document.getElementById('scan-input').value.trim().toUpperCase();
     if (!raw) return;
-    if (!selectedEventId) { showResult(result,'warn','⚠ Zgjidhni eventin së pari',''); return; }
-
-    const att = attendees.find(a => a.code === raw);
-
-    if (!att) {
-      showResult(result, 'error', '❌ KOD I PAVLEFSHËM', `Asnjë pjesëmarrës i regjistruar nuk u gjet për kodin:<br><strong>${raw}</strong>`);
-      return;
-    }
-
-    const already = (att.checkedInEvents||[]).includes(selectedEventId);
-    if (already) {
-      showResult(result, 'warn', '⚠ TASHMË I PRANUAR',
-        `<strong>${att.name}</strong> është pranuar tashmë në këtë event.<br>Ky kod nuk mund të përdoret sërish për të njëjtin event.`);
-      return;
-    }
-
-    // ✅ Check in
-    const checkedAt = nowStr();
-    try {
-      await updateDoc(doc(db,'attendees',att.id), {
-        checkedInEvents: arrayUnion(selectedEventId),
-        checkedAt
-      });
-      showResult(result, 'success', '✅ PRANIMI U KRY ME SUKSES',
-        `<strong style="font-size:1.1rem">${att.name}</strong><br>${att.email||''} · ${checkedAt}`);
-    } catch(e) {
-      showResult(result, 'error', '❌ GABIM', e.message);
-    }
+    await handleCode(raw);
     document.getElementById('scan-input').value = '';
     document.getElementById('scan-input').focus();
   };
 
+  async function handleCode(raw) {
+    const result = document.getElementById('scan-result');
+    if (!selectedEventId) { showResult(result,'warn','⚠ Zgjidhni eventin së pari',''); return; }
+    const att = attendees.find(a => a.code === raw);
+    if (!att) {
+      showResult(result,'error','❌ KOD I PAVLEFSHËM',`Asnjë pjesëmarrës për kodin <strong>${raw}</strong>`);
+      return;
+    }
+    const eventRec = att.attendance?.[selectedEventId] || null;
+
+    if (mode === 'checkin') {
+      if (eventRec?.checkIn) {
+        showResult(result,'warn','⚠ TASHMË I PRANUAR',
+          `<strong>${att.name}</strong> është pranuar në ${eventRec.checkIn}.` + (eventRec.checkOut ? `<br>Ka dalur në ${eventRec.checkOut}.` : ''));
+        return;
+      }
+      const ts = nowStr();
+      try {
+        await updateDoc(doc(db,'attendees',att.id), {
+          [`attendance.${selectedEventId}.checkIn`]: ts,
+          [`attendance.${selectedEventId}.checkInAt`]: serverTimestamp(),
+          [`attendance.${selectedEventId}.checkInBy`]: currentUser.username
+        });
+        showResult(result,'success','✅ PRANIMI U KRY ME SUKSES',
+          `<strong style="font-size:1.1rem">${att.name}</strong><br>${att.email||''} · ${ts}`);
+      } catch(e) { showResult(result,'error','❌ GABIM',e.message); }
+
+    } else { // checkout
+      if (!eventRec?.checkIn) {
+        showResult(result,'error','❌ NUK KA CHECK-IN',
+          `<strong>${att.name}</strong> nuk është pranuar ende për këtë event.<br>Bëje check-in së pari.`);
+        return;
+      }
+      if (eventRec.checkOut) {
+        showResult(result,'warn','⚠ TASHMË KA DALUR',
+          `<strong>${att.name}</strong> ka dalur në ${eventRec.checkOut}.<br>Nuk mund të bëjë check-out përsëri.`);
+        return;
+      }
+      // Time check: >= 10 minutes since check-in
+      const checkInMs = eventRec.checkInAt?.seconds ? eventRec.checkInAt.seconds*1000 : null;
+      if (checkInMs) {
+        const elapsed = nowMs() - checkInMs;
+        const needed = MIN_MINUTES * 60 * 1000;
+        if (elapsed < needed) {
+          const remMs = needed - elapsed;
+          const mins = Math.floor(remMs/60000);
+          const secs = Math.floor((remMs%60000)/1000);
+          showResult(result,'warn','⏱ SHUMË HERËT PËR CHECK-OUT',
+            `<strong>${att.name}</strong> ka bërë check-in në ${eventRec.checkIn}.<br>` +
+            `Duhen të paktën <strong>${MIN_MINUTES} minuta</strong> midis check-in dhe check-out.<br>` +
+            `Prit edhe: <strong style="font-size:1.2rem">${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}</strong>`);
+          return;
+        }
+      }
+      const ts = nowStr();
+      try {
+        await updateDoc(doc(db,'attendees',att.id), {
+          [`attendance.${selectedEventId}.checkOut`]: ts,
+          [`attendance.${selectedEventId}.checkOutAt`]: serverTimestamp(),
+          [`attendance.${selectedEventId}.checkOutBy`]: currentUser.username
+        });
+        showResult(result,'success','✅ DALJA U REGJISTRUA',
+          `<strong style="font-size:1.1rem">${att.name}</strong><br>${att.email||''} · ${ts}`);
+      } catch(e) { showResult(result,'error','❌ GABIM',e.message); }
+    }
+  }
+
   function showResult(el, type, title, msg) {
     el.className = `scan-result ${type}`;
     el.innerHTML = `<div class="sr-title">${title}</div>${msg?`<div class="sr-msg">${msg}</div>`:''}`;
-    const ms = type==='success' ? 3500 : 5000;
-    setTimeout(()=>{ el.innerHTML=''; el.className='scan-result'; }, ms);
+    const ms = type==='success' ? 3500 : 6000;
+    clearTimeout(el._to);
+    el._to = setTimeout(()=>{ el.innerHTML=''; el.className='scan-result'; }, ms);
   }
 
+  // ========== CAMERA QR ==========
+  window.toggleCamera = async function() {
+    const box = document.getElementById('qr-reader');
+    const btn = document.getElementById('btn-cam');
+    if (scanning) {
+      try { await html5QrCode.stop(); } catch(e){}
+      scanning = false;
+      box.style.display = 'none';
+      btn.textContent = '📷 Hap Kamerën';
+      btn.classList.remove('active');
+      return;
+    }
+    box.style.display = 'block';
+    btn.textContent = '⏹ Mbyll Kamerën';
+    btn.classList.add('active');
+    if (!html5QrCode) html5QrCode = new Html5Qrcode("qr-reader");
+    try {
+      await html5QrCode.start(
+        { facingMode: "environment" },
+        { fps: 10, qrbox: { width: 240, height: 240 } },
+        async (decodedText) => {
+          const code = decodedText.trim().toUpperCase();
+          // Debounce: ignore same code within 2.5s
+          const now = Date.now();
+          if (code === lastScannedCode && (now - lastScanTime) < 2500) return;
+          lastScannedCode = code;
+          lastScanTime = now;
+          // Brief pause to avoid spam, but keep camera on
+          await handleCode(code);
+        },
+        () => { /* ignore per-frame decode errors */ }
+      );
+      scanning = true;
+    } catch(e) {
+      box.style.display = 'none';
+      btn.textContent = '📷 Hap Kamerën';
+      btn.classList.remove('active');
+      scanning = false;
+      const result = document.getElementById('scan-result');
+      showResult(result,'error','❌ S\'MUND TË HAP KAMERËN',
+        'Lejo kamerën në shfletues ose përdor hyrjen manuale.<br>' + e.message);
+    }
+  };
+
+  // ========== EXCEL EXPORT ==========
+  window.exportExcel = function() {
+    if (!events.length) { alert('Asnjë event.'); return; }
+    // Build rows grouped by day
+    const byDay = {}; // dayKey -> rows[]
+    for (const evt of events) {
+      const dayKey = evt.date || 'Pa datë';
+      if (!byDay[dayKey]) byDay[dayKey] = [];
+      for (const a of attendees) {
+        const rec = a.attendance?.[evt.id];
+        if (!rec?.checkIn) continue;
+        let duration = '';
+        if (rec.checkInAt?.seconds && rec.checkOutAt?.seconds) {
+          const mins = Math.round((rec.checkOutAt.seconds - rec.checkInAt.seconds)/60);
+          duration = `${Math.floor(mins/60)}h ${mins%60}m`;
+        }
+        byDay[dayKey].push({
+          'Emri': a.name,
+          'Email': a.email || '',
+          'Kodi': a.code,
+          'Eventi': evt.name,
+          'Vendi': evt.loc || '',
+          'Data': evt.date || '',
+          'Ora e Eventit': evt.time || '',
+          'Check-In': rec.checkIn || '',
+          'Check-Out': rec.checkOut || '',
+          'Kohëzgjatja': duration,
+          'Pranuar Nga': rec.checkInBy || '',
+          'Dalje Nga': rec.checkOutBy || ''
+        });
+      }
+    }
+    const wb = XLSX.utils.book_new();
+    const days = Object.keys(byDay).sort();
+    if (!days.length || days.every(d => !byDay[d].length)) {
+      alert('Asnjë të dhënë për eksportim.'); return;
+    }
+    for (const day of days) {
+      if (!byDay[day].length) continue;
+      const ws = XLSX.utils.json_to_sheet(byDay[day]);
+      // Column widths
+      ws['!cols'] = [
+        {wch:22},{wch:28},{wch:14},{wch:24},{wch:16},{wch:12},{wch:10},
+        {wch:10},{wch:10},{wch:12},{wch:14},{wch:14}
+      ];
+      const sheetName = (day === 'Pa datë' ? 'Pa datë' : day).slice(0,31);
+      XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    }
+    const stamp = new Date().toISOString().slice(0,16).replace(/[:T]/g,'-');
+    XLSX.writeFile(wb, `konferenca_prania_${stamp}.xlsx`);
+  };
+
+  // ========== INIT ==========
   document.addEventListener('DOMContentLoaded', ()=>{
+    // Auto-login from session
+    const saved = sessionStorage.getItem(SESSION_KEY);
+    if (saved) {
+      try {
+        const s = JSON.parse(saved);
+        // Re-verify against DB
+        getDocs(query(collection(db,'users'), where('username','==',s.username), where('role','==','scanner'))).then(snap => {
+          if (!snap.empty && snap.docs[0].data().active !== false) {
+            currentUser = { id: snap.docs[0].id, ...snap.docs[0].data() };
+            document.getElementById('login').style.display = 'none';
+            document.getElementById('app').style.display = 'block';
+            document.getElementById('user-badge').textContent = currentUser.displayName || currentUser.username;
+            initApp();
+          } else {
+            sessionStorage.removeItem(SESSION_KEY);
+          }
+        });
+      } catch(e) { sessionStorage.removeItem(SESSION_KEY); }
+    }
     document.getElementById('scan-input').addEventListener('keydown', e=>{ if(e.key==='Enter') window.doScan(); });
+    document.getElementById('login-pass').addEventListener('keydown', e=>{ if(e.key==='Enter') window.doLogin(); });
+    document.getElementById('login-user').addEventListener('keydown', e=>{ if(e.key==='Enter') document.getElementById('login-pass').focus(); });
   });
 </script>
 <style>
@@ -141,81 +379,140 @@
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-height:100vh}
 body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:48px 48px;opacity:0.2;pointer-events:none;z-index:0}
+
+/* Login */
+#login{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;background:var(--bg)}
+.lbox{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:40px;max-width:360px;width:90%;text-align:center;position:relative;z-index:1}
+.llm{width:50px;height:50px;border:2px solid var(--accent);display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:7px;margin:0 auto 18px}
+.llm span{background:var(--accent);display:block}.llm span:nth-child(2),.llm span:nth-child(3){background:transparent;border:1.5px solid var(--accent)}
+.lbox h2{font-size:1.3rem;font-weight:800;margin-bottom:4px}
+.lbox .lsub{font-size:0.77rem;color:var(--muted);font-family:'DM Mono',monospace;margin-bottom:22px}
+.lbox input{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:12px 14px;font-family:'DM Mono',monospace;font-size:0.9rem;border-radius:4px;outline:none;margin-bottom:10px;transition:border-color 0.2s}
+.lbox input:focus{border-color:var(--accent)}
+.lerr{color:var(--accent2);font-family:'DM Mono',monospace;font-size:0.76rem;margin-bottom:10px;display:none}
+.btn-login{width:100%;background:var(--accent);color:#000;border:none;padding:12px;border-radius:4px;font-family:'Syne',sans-serif;font-weight:800;font-size:0.9rem;cursor:pointer;transition:all 0.2s}
+.btn-login:hover{filter:brightness(1.1)}.btn-login:disabled{opacity:0.5;cursor:not-allowed}
+
+#app{display:none}
 .wrap{position:relative;z-index:1;max-width:680px;margin:0 auto;padding:0 20px 60px}
-header{padding:30px 0 22px;border-bottom:1px solid var(--border);margin-bottom:28px;display:flex;align-items:center;gap:14px}
+header{padding:24px 0 20px;border-bottom:1px solid var(--border);margin-bottom:24px;display:flex;align-items:center;gap:14px}
 .lm{width:40px;height:40px;border:2px solid var(--accent);display:grid;grid-template-columns:1fr 1fr;gap:3px;padding:5px;flex-shrink:0}
 .lm span{background:var(--accent);display:block}
 .lm span:nth-child(2),.lm span:nth-child(3){background:transparent;border:1.5px solid var(--accent)}
 .badge{display:inline-flex;align-items:center;gap:5px;background:rgba(0,229,180,0.1);border:1px solid rgba(0,229,180,0.3);border-radius:20px;padding:3px 9px;font-family:'DM Mono',monospace;font-size:0.67rem;color:var(--accent);margin-left:8px}
 .dot{width:6px;height:6px;background:var(--accent);border-radius:50%;animation:p 1.5s infinite}
 @keyframes p{0%,100%{opacity:1}50%{opacity:0.4}}
+.user-chip{margin-left:auto;display:flex;align-items:center;gap:8px;font-family:'DM Mono',monospace;font-size:0.75rem;color:var(--muted)}
+.btn-logout{background:transparent;border:1px solid var(--border);color:var(--muted);padding:5px 10px;border-radius:4px;font-family:'DM Mono',monospace;font-size:0.7rem;cursor:pointer;transition:all 0.2s}
+.btn-logout:hover{border-color:var(--accent2);color:var(--accent2)}
 
-/* Event select */
+/* Top bar w/ export */
+.topbar{display:flex;justify-content:flex-end;gap:8px;margin-bottom:14px}
+.btn-export{background:var(--surface);border:1px solid var(--accent);color:var(--accent);padding:9px 16px;border-radius:6px;font-family:'DM Mono',monospace;font-size:0.78rem;cursor:pointer;transition:all 0.2s}
+.btn-export:hover{background:var(--accent);color:#000}
+
 .event-select-wrap{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px;margin-bottom:20px}
 .event-select-wrap label{font-size:0.7rem;font-family:'DM Mono',monospace;color:var(--muted);text-transform:uppercase;letter-spacing:0.09em;display:block;margin-bottom:8px}
 select{width:100%;background:var(--surface);border:1.5px solid var(--border);color:var(--text);padding:11px 14px;font-family:'DM Mono',monospace;font-size:0.88rem;border-radius:6px;outline:none;transition:border-color 0.2s;cursor:pointer}
 select:focus{border-color:var(--accent)}
 select option{background:var(--surface)}
 
-/* No event */
 #no-event-msg{text-align:center;padding:48px 20px;color:var(--muted);font-family:'DM Mono',monospace;font-size:0.85rem}
 
+/* Mode toggle */
+.mode-toggle{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:var(--surface);border:1px solid var(--border);padding:4px;border-radius:8px;margin-bottom:16px}
+.btn-mode{background:transparent;border:none;padding:11px;border-radius:5px;cursor:pointer;font-family:'Syne',sans-serif;font-weight:700;font-size:0.85rem;color:var(--muted);transition:all 0.2s}
+.btn-mode.active{background:var(--accent);color:#000}
+.btn-mode:nth-child(2).active{background:var(--warn)}
+
+.mode-label{text-align:center;font-family:'DM Mono',monospace;font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.12em;margin-bottom:14px}
+
 /* Stats */
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}
-.stat{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;text-align:center}
-.stat-n{font-family:'DM Mono',monospace;font-size:1.8rem;font-weight:500}
-.stat-n.g{color:var(--accent)}.stat-n.o{color:var(--warn)}
-.stat-l{font-size:0.63rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;margin-top:2px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:18px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px 8px;text-align:center}
+.stat-n{font-family:'DM Mono',monospace;font-size:1.5rem;font-weight:500}
+.stat-n.g{color:var(--accent)}.stat-n.o{color:var(--warn)}.stat-n.r{color:var(--accent2)}
+.stat-l{font-size:0.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:2px}
 
 /* Scanner */
-.scanner-box{background:var(--card);border:2px dashed var(--border);border-radius:10px;padding:32px 24px;text-align:center;margin-bottom:20px;transition:border-color 0.3s}
-.si{font-size:3rem;margin-bottom:10px}
-.sh{color:var(--muted);font-size:0.82rem;margin-bottom:20px;line-height:1.6;font-family:'DM Mono',monospace}
-.code-input{background:var(--surface);border:2px solid var(--border);color:var(--text);padding:15px 18px;font-family:'DM Mono',monospace;font-size:1.25rem;border-radius:6px;outline:none;width:100%;max-width:360px;text-align:center;letter-spacing:0.15em;transition:border-color 0.2s;margin-bottom:14px;display:block;margin-left:auto;margin-right:auto}
-.code-input:focus{border-color:var(--accent)}
-.btn-scan{background:var(--accent);color:#000;border:none;padding:13px 40px;border-radius:6px;font-family:'Syne',sans-serif;font-weight:800;font-size:0.95rem;cursor:pointer;transition:all 0.2s}
-.btn-scan:hover{filter:brightness(1.1);transform:translateY(-1px)}
+.scanner-box{background:var(--card);border:2px dashed var(--border);border-radius:10px;padding:24px 20px;text-align:center;margin-bottom:20px}
+.si{font-size:2.4rem;margin-bottom:6px}
+.sh{color:var(--muted);font-size:0.78rem;margin-bottom:14px;line-height:1.6;font-family:'DM Mono',monospace}
+.btn-cam{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:10px 22px;border-radius:6px;font-family:'DM Mono',monospace;font-size:0.85rem;cursor:pointer;transition:all 0.2s;margin-bottom:14px}
+.btn-cam:hover{border-color:var(--accent);color:var(--accent)}
+.btn-cam.active{background:var(--accent2);color:#fff;border-color:var(--accent2)}
+#qr-reader{display:none;max-width:320px;margin:0 auto 14px;border-radius:8px;overflow:hidden}
+#qr-reader video{border-radius:8px}
 
-/* Result */
-.scan-result{border-radius:8px;font-family:'DM Mono',monospace;margin-top:18px;animation:pi 0.3s ease}
-.scan-result.success{background:rgba(0,229,180,0.1);border:1px solid var(--accent);padding:18px;color:var(--accent)}
-.scan-result.error{background:rgba(255,79,109,0.1);border:1px solid var(--accent2);padding:18px;color:var(--accent2)}
-.scan-result.warn{background:rgba(255,181,71,0.1);border:1px solid var(--warn);padding:18px;color:var(--warn)}
+.divider{display:flex;align-items:center;gap:10px;color:var(--muted);font-family:'DM Mono',monospace;font-size:0.68rem;margin:12px 0;text-transform:uppercase;letter-spacing:0.12em}
+.divider::before,.divider::after{content:'';flex:1;height:1px;background:var(--border)}
+
+.code-input{background:var(--surface);border:2px solid var(--border);color:var(--text);padding:13px 16px;font-family:'DM Mono',monospace;font-size:1.1rem;border-radius:6px;outline:none;width:100%;max-width:320px;text-align:center;letter-spacing:0.15em;transition:border-color 0.2s;margin-bottom:12px;display:block;margin-left:auto;margin-right:auto}
+.code-input:focus{border-color:var(--accent)}
+.btn-scan{background:var(--accent);color:#000;border:none;padding:12px 36px;border-radius:6px;font-family:'Syne',sans-serif;font-weight:800;font-size:0.9rem;cursor:pointer;transition:all 0.2s}
+.btn-scan:hover{filter:brightness(1.1)}
+.btn-scan.btn-out{background:var(--warn)}
+
+.scan-result{border-radius:8px;font-family:'DM Mono',monospace;margin-top:14px;animation:pi 0.3s ease}
+.scan-result.success{background:rgba(0,229,180,0.1);border:1px solid var(--accent);padding:16px;color:var(--accent)}
+.scan-result.error{background:rgba(255,79,109,0.1);border:1px solid var(--accent2);padding:16px;color:var(--accent2)}
+.scan-result.warn{background:rgba(255,181,71,0.1);border:1px solid var(--warn);padding:16px;color:var(--warn)}
 .sr-title{font-size:0.88rem;font-weight:500;margin-bottom:5px}
-.sr-msg{font-size:0.82rem;color:var(--text);line-height:1.6}
+.sr-msg{font-size:0.8rem;color:var(--text);line-height:1.6}
 @keyframes pi{from{opacity:0;transform:scale(0.96)}to{opacity:1;transform:scale(1)}}
 
-/* Attendance list */
-.list-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px}
-.list-title{font-size:0.9rem;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:8px;color:var(--muted)}
+.list-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:18px}
+.list-title{font-size:0.85rem;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px;color:var(--muted)}
 .list-title::after{content:'';flex:1;height:1px;background:var(--border)}
-.att-row{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--border);transition:background 0.3s}
+.att-row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);transition:background 0.3s}
 .att-row.new{animation:hl 1.2s ease}
 @keyframes hl{0%{background:rgba(0,229,180,0.08)}100%{background:transparent}}
 .att-row:last-child{border-bottom:none}
-.att-num{font-family:'DM Mono',monospace;font-size:0.75rem;color:var(--muted);width:28px;text-align:right;flex-shrink:0}
+.att-num{font-family:'DM Mono',monospace;font-size:0.72rem;color:var(--muted);width:26px;text-align:right;flex-shrink:0}
 .att-info{flex:1;min-width:0}
-.att-name{font-weight:700;font-size:0.88rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.att-meta{font-size:0.72rem;color:var(--muted);font-family:'DM Mono',monospace;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.att-time{font-family:'DM Mono',monospace;font-size:0.7rem;color:var(--muted);flex-shrink:0;text-align:right}
-.empty-sm{text-align:center;padding:28px;color:var(--muted);font-family:'DM Mono',monospace;font-size:0.8rem}
+.att-name{font-weight:700;font-size:0.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:6px}
+.att-meta{font-size:0.7rem;color:var(--muted);font-family:'DM Mono',monospace;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chip-in{background:rgba(0,229,180,0.15);color:var(--accent);border:1px solid rgba(0,229,180,0.3);padding:1px 6px;border-radius:10px;font-size:0.6rem;font-family:'DM Mono',monospace;font-weight:500}
+.chip-out{background:rgba(255,181,71,0.15);color:var(--warn);border:1px solid rgba(255,181,71,0.3);padding:1px 6px;border-radius:10px;font-size:0.6rem;font-family:'DM Mono',monospace;font-weight:500}
+.empty-sm{text-align:center;padding:24px;color:var(--muted);font-family:'DM Mono',monospace;font-size:0.78rem}
 
 #scan-section{display:none}
 </style>
 </head>
 <body>
+
+<!-- LOGIN -->
+<div id="login">
+  <div class="lbox">
+    <div class="llm"><span></span><span></span><span></span><span></span></div>
+    <h2>Hyrja e Skanerit</h2>
+    <p class="lsub">Aksesi vetëm për skanerë të autorizuar</p>
+    <input type="text" id="login-user" placeholder="Emri i përdoruesit" autocomplete="username">
+    <input type="password" id="login-pass" placeholder="Fjalëkalimi" autocomplete="current-password">
+    <p class="lerr" id="login-err"></p>
+    <button class="btn-login" id="btn-login" onclick="doLogin()">Hyr →</button>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="app">
 <div class="wrap">
   <header>
     <div class="lm"><span></span><span></span><span></span><span></span></div>
     <div>
-      <h1 style="font-size:1.3rem;font-weight:800;letter-spacing:-0.02em">
-        Konferenca <span class="badge"><span class="dot"></span>SKANER</span>
-      </h1>
-      <p style="font-size:0.74rem;color:var(--muted);font-family:'DM Mono',monospace;margin-top:2px">pranimi i pjesëmarrësve · kohë reale</p>
+      <h1 style="font-size:1.2rem;font-weight:800;letter-spacing:-0.02em">Konferenca <span class="badge"><span class="dot"></span>SKANER</span></h1>
+      <p style="font-size:0.72rem;color:var(--muted);font-family:'DM Mono',monospace;margin-top:2px">pranimi & dalja · kohë reale</p>
+    </div>
+    <div class="user-chip">
+      <span id="user-badge">—</span>
+      <button class="btn-logout" onclick="logout()">Dil</button>
     </div>
   </header>
 
-  <!-- Event selector -->
+  <div class="topbar">
+    <button class="btn-export" onclick="exportExcel()">⬇ Shkarko Excel</button>
+  </div>
+
   <div class="event-select-wrap">
     <label>Zgjidhni eventin që po skanoni</label>
     <select id="event-select" onchange="selectEvent()">
@@ -223,33 +520,47 @@ select option{background:var(--surface)}
     </select>
   </div>
 
-  <!-- No event selected -->
   <div id="no-event-msg">📋 Zgjidhni eventin më sipër për të filluar skanimin.</div>
 
-  <!-- Scan section (shown after event selected) -->
   <div id="scan-section">
+
+    <!-- Mode toggle -->
+    <div class="mode-toggle">
+      <button class="btn-mode active" id="btn-mode-in" onclick="setMode('checkin')">✓ CHECK-IN</button>
+      <button class="btn-mode" id="btn-mode-out" onclick="setMode('checkout')">✗ CHECK-OUT</button>
+    </div>
+    <div class="mode-label" id="mode-label">PRANIMI (CHECK-IN)</div>
+
     <!-- Stats -->
     <div class="stats">
       <div class="stat"><div class="stat-n" id="stat-total">—</div><div class="stat-l">Gjithsej</div></div>
-      <div class="stat"><div class="stat-n g" id="stat-checked">—</div><div class="stat-l">Të Pranuar</div></div>
-      <div class="stat"><div class="stat-n o" id="stat-left">—</div><div class="stat-l">Mbetur</div></div>
+      <div class="stat"><div class="stat-n g" id="stat-in">—</div><div class="stat-l">Check-In</div></div>
+      <div class="stat"><div class="stat-n o" id="stat-out">—</div><div class="stat-l">Check-Out</div></div>
+      <div class="stat"><div class="stat-n r" id="stat-left">—</div><div class="stat-l">Mbetur</div></div>
     </div>
 
     <!-- Scanner -->
-    <div class="scanner-box" id="scanner-box">
+    <div class="scanner-box">
       <div class="si">📲</div>
-      <p class="sh">Shkruaj ose skano kodin unik të pjesëmarrësit<br>Shtyp <strong>Enter</strong> ose kliko butonin për të pranuar</p>
+      <p class="sh">Skano me kamerë ose shkruaj kodin manualisht</p>
+
+      <button class="btn-cam" id="btn-cam" onclick="toggleCamera()">📷 Hap Kamerën</button>
+      <div id="qr-reader"></div>
+
+      <div class="divider">ose shkruaj kodin</div>
+
       <input class="code-input" id="scan-input" placeholder="p.sh. KNF-AB3X9Y2Z" oninput="this.value=this.value.toUpperCase()">
-      <button class="btn-scan" onclick="doScan()">✓ Pranoj</button>
+      <button class="btn-scan" id="btn-action" onclick="doScan()">✓ Pranoj</button>
       <div id="scan-result" class="scan-result"></div>
     </div>
 
     <!-- Attendance list -->
     <div class="list-card">
-      <div class="list-title">Pjesëmarrësit e Pranuar</div>
+      <div class="list-title">Pjesëmarrësit e Pranuar (ky event)</div>
       <div id="attendance-list"><div class="empty-sm">Asnjë pranim ende.</div></div>
     </div>
   </div>
+</div>
 </div>
 </body>
 </html>
