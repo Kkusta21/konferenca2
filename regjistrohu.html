@@ -5,73 +5,174 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Konferenca · Regjistrohu</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-<script type="module">
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-  import { getFirestore, collection, addDoc, query, where, getDocs, serverTimestamp }
-    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+<script>
+  // No Firebase client SDK needed anymore — all writes go through the server APIs
+  // which use firebase-admin and the service account for safety.
 
-  const firebaseConfig = {
-    apiKey: "AIzaSyDvIs7NNrM_1C7Jb2DWULKiKvCUrtJVzTg",
-    authDomain: "konferenca.firebaseapp.com",
-    projectId: "konferenca",
-    storageBucket: "konferenca.firebasestorage.app",
-    messagingSenderId: "862842008546",
-    appId: "1:862842008546:web:b22caae19c00db52453fbb"
-  };
+  let pendingEmail = '';
+  let pendingName  = '';
+  let resendTimer  = 0;
+  let resendIv     = null;
 
-  const db = getFirestore(initializeApp(firebaseConfig));
-
-  function uid() {
-    const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    let s = 'KNF-';
-    for (let i=0;i<8;i++) s += c[Math.floor(Math.random()*c.length)];
-    return s;
+  function showErr(id, msg) {
+    const el = document.getElementById(id);
+    el.textContent = msg || el.dataset.default || '';
+    el.style.display = 'block';
+  }
+  function hideErr(id) {
+    const el = document.getElementById(id);
+    el.style.display = 'none';
+  }
+  function hideAllErrors() {
+    ['err-name','err-email','err-step1','err-otp','err-step2'].forEach(hideErr);
   }
 
-  async function sendEmail(name, email, code) {
-    const res = await fetch('/api/send-email', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, email, code })
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Email dështoi');
-    }
-  }
-
-  window.submit = async function() {
+  async function sendOtp() {
+    hideAllErrors();
     const name  = document.getElementById('reg-name').value.trim();
-    const email = document.getElementById('reg-email').value.trim();
+    const email = document.getElementById('reg-email').value.trim().toLowerCase();
+
     let ok = true;
-    document.getElementById('err-name').style.display  = name  ? 'none' : 'block'; if (!name)  ok = false;
-    document.getElementById('err-email').style.display = email ? 'none' : 'block'; if (!email) ok = false;
-    document.getElementById('err-dup').style.display   = 'none';
-    document.getElementById('err-gen').style.display   = 'none';
+    if (!name)  { showErr('err-name',  '⚠ Emri është i detyrueshëm.'); ok = false; }
+    if (!email) { showErr('err-email', '⚠ Email-i është i detyrueshëm.'); ok = false; }
+    else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      showErr('err-email', '⚠ Format i pavlefshëm email-i.'); ok = false;
+    }
     if (!ok) return;
 
-    const dup = await getDocs(query(collection(db,'attendees'), where('email','==',email)));
-    if (!dup.empty) { document.getElementById('err-dup').style.display='block'; return; }
-
-    const code = uid();
-    const btn  = document.getElementById('btn-reg');
-    btn.disabled = true; btn.textContent = 'Duke regjistruar…';
+    const btn = document.getElementById('btn-send-otp');
+    btn.disabled = true; btn.textContent = 'Duke dërguar kodin…';
 
     try {
-      await addDoc(collection(db,'attendees'), { name, email, code, checkedInEvents:[], createdAt:serverTimestamp() });
-      await sendEmail(name, email, code);
+      const res  = await fetch('/api/send-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, email })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Dërgimi i kodit dështoi');
+
+      pendingEmail = email;
+      pendingName  = name;
+
+      document.getElementById('step-1').style.display = 'none';
+      document.getElementById('step-2').style.display = 'block';
+      document.getElementById('sent-to').textContent = email;
+      document.getElementById('otp-input').focus();
+
+      startResendCountdown(60);
+    } catch (e) {
+      showErr('err-step1', '⚠ ' + e.message);
+    } finally {
+      btn.disabled = false; btn.textContent = 'Dërgo Kodin e Verifikimit →';
+    }
+  }
+
+  async function verifyOtp() {
+    hideErr('err-otp'); hideErr('err-step2');
+    const code = document.getElementById('otp-input').value.trim();
+    if (!/^\d{6}$/.test(code)) {
+      showErr('err-otp', '⚠ Kodi duhet të jetë 6 shifra.');
+      return;
+    }
+
+    const btn = document.getElementById('btn-verify');
+    btn.disabled = true; btn.textContent = 'Duke verifikuar…';
+
+    try {
+      const res  = await fetch('/api/verify-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: pendingEmail, code })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Verifikimi dështoi');
+
+      // Success → show final screen
+      document.getElementById('step-2').style.display   = 'none';
       document.getElementById('form-wrap').style.display = 'none';
       document.getElementById('success').style.display   = 'block';
-      document.getElementById('suc-name').textContent = name;
-      document.getElementById('suc-code').textContent = code;
+      document.getElementById('suc-name').textContent = data.name || pendingName;
+      document.getElementById('suc-code').textContent = data.code;
       const d = document.getElementById('suc-qr'); d.innerHTML = '';
-      new QRCode(d, { text:code, width:190, height:190, colorDark:'#000', colorLight:'#fff', correctLevel:QRCode.CorrectLevel.H });
-    } catch(e) {
-      document.getElementById('err-gen').textContent = 'Gabim: ' + e.message;
-      document.getElementById('err-gen').style.display = 'block';
-      btn.disabled = false; btn.textContent = 'Regjistrohu →';
+      new QRCode(d, {
+        text: data.code, width: 190, height: 190,
+        colorDark: '#000', colorLight: '#fff',
+        correctLevel: QRCode.CorrectLevel.H
+      });
+      clearInterval(resendIv);
+    } catch (e) {
+      showErr('err-otp', '⚠ ' + e.message);
+    } finally {
+      btn.disabled = false; btn.textContent = 'Verifiko & Merr QR →';
     }
-  };
+  }
+
+  async function resendOtp() {
+    if (resendTimer > 0) return;
+    const btn = document.getElementById('btn-resend');
+    btn.disabled = true;
+    try {
+      const res  = await fetch('/api/send-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: pendingName, email: pendingEmail })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Dërgimi dështoi');
+      startResendCountdown(60);
+      showErr('err-step2', '✓ Kodi i ri u dërgua.');
+      document.getElementById('err-step2').style.color = 'var(--accent)';
+    } catch (e) {
+      showErr('err-step2', '⚠ ' + e.message);
+      document.getElementById('err-step2').style.color = 'var(--accent2)';
+      btn.disabled = false;
+    }
+  }
+
+  function goBack() {
+    clearInterval(resendIv);
+    document.getElementById('step-2').style.display = 'none';
+    document.getElementById('step-1').style.display = 'block';
+    document.getElementById('otp-input').value = '';
+    hideAllErrors();
+  }
+
+  function startResendCountdown(seconds) {
+    resendTimer = seconds;
+    const btn = document.getElementById('btn-resend');
+    clearInterval(resendIv);
+    function tick() {
+      if (resendTimer <= 0) {
+        btn.disabled = false;
+        btn.textContent = 'Dërgo kodin përsëri';
+        clearInterval(resendIv);
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = `Dërgo kodin përsëri (${resendTimer}s)`;
+      resendTimer--;
+    }
+    tick();
+    resendIv = setInterval(tick, 1000);
+  }
+
+  window.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('reg-email').addEventListener('keydown', e => {
+      if (e.key === 'Enter') sendOtp();
+    });
+    document.getElementById('otp-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') verifyOtp();
+    });
+    document.getElementById('otp-input').addEventListener('input', e => {
+      e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6);
+    });
+  });
+
+  window.sendOtp   = sendOtp;
+  window.verifyOtp = verifyOtp;
+  window.resendOtp = resendOtp;
+  window.goBack    = goBack;
 </script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap');
@@ -92,11 +193,22 @@ h1{font-size:2rem;font-weight:800;letter-spacing:-0.03em;margin-bottom:8px}
 label{font-size:0.7rem;font-family:'DM Mono',monospace;color:var(--muted);text-transform:uppercase;letter-spacing:0.09em}
 input{background:var(--surface);border:1.5px solid var(--border);color:var(--text);padding:13px 16px;font-family:'DM Mono',monospace;font-size:0.9rem;border-radius:6px;outline:none;transition:border-color 0.2s;width:100%}
 input:focus{border-color:var(--accent)}
+.otp-input{text-align:center;letter-spacing:0.6em;font-size:1.4rem;font-weight:500;padding:15px}
 .err{color:var(--accent2);font-size:0.74rem;font-family:'DM Mono',monospace;display:none;margin-top:2px}
 .btn{width:100%;background:var(--accent);color:#000;border:none;padding:15px;border-radius:8px;font-family:'Syne',sans-serif;font-weight:800;font-size:0.95rem;cursor:pointer;transition:all 0.2s;margin-top:18px}
 .btn:hover{filter:brightness(1.1);transform:translateY(-1px)}
 .btn:disabled{opacity:0.6;transform:none;cursor:not-allowed}
+.btn-ghost{background:transparent;border:1px solid var(--border);color:var(--muted);padding:11px;border-radius:6px;font-family:'DM Mono',monospace;font-size:0.78rem;cursor:pointer;margin-top:10px;width:100%;transition:all 0.2s}
+.btn-ghost:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+.btn-ghost:disabled{opacity:0.5;cursor:not-allowed}
+.btn-link{background:none;border:none;color:var(--muted);font-family:'DM Mono',monospace;font-size:0.75rem;cursor:pointer;padding:8px;margin-top:6px;text-decoration:underline}
+.btn-link:hover{color:var(--accent)}
 .note{font-size:0.72rem;color:var(--muted);font-family:'DM Mono',monospace;text-align:center;margin-top:10px}
+.step-badge{display:inline-flex;align-items:center;gap:6px;background:rgba(0,229,180,0.08);border:1px solid rgba(0,229,180,0.25);border-radius:20px;padding:5px 12px;font-family:'DM Mono',monospace;font-size:0.72rem;color:var(--accent);margin-bottom:14px}
+.step-title{font-size:1.15rem;font-weight:800;margin-bottom:6px}
+.step-sub{color:var(--muted);font-size:0.8rem;font-family:'DM Mono',monospace;line-height:1.65;margin-bottom:22px}
+.step-sub strong{color:var(--text)}
+#step-2{display:none}
 #success{display:none;text-align:center;padding:16px 0}
 .sicon{font-size:4rem;margin-bottom:14px;animation:pop 0.5s ease}
 @keyframes pop{0%{transform:scale(0)}70%{transform:scale(1.1)}100%{transform:scale(1)}}
@@ -116,12 +228,16 @@ input:focus{border-color:var(--accent)}
     <h1>Regjistrohu</h1>
     <p class="sub">Plotëso emrin dhe emailin tënd.<br>Do të marrësh një kod QR unik për gjithë konferencën.</p>
   </header>
+
   <div id="form-wrap">
     <div class="banner">
       <span style="font-size:1.2rem;flex-shrink:0">🎫</span>
       <span>Kodi QR që do të marrësh është i vlefshëm për <strong>të gjitha eventet</strong> e konferencës. Nuk duhet të regjistrohesh për çdo event.</span>
     </div>
-    <div class="card">
+
+    <!-- STEP 1: Enter name + email -->
+    <div id="step-1" class="card">
+      <div class="step-badge">HAPI 1/2 · Të dhënat</div>
       <div class="field">
         <label>Emri i Plotë</label>
         <input id="reg-name" type="text" placeholder="p.sh. Agim Berisha" autocomplete="name">
@@ -132,12 +248,31 @@ input:focus{border-color:var(--accent)}
         <input id="reg-email" type="email" placeholder="p.sh. agim@email.com" autocomplete="email">
         <p class="err" id="err-email">⚠ Email-i është i detyrueshëm.</p>
       </div>
-      <p class="err" id="err-dup" style="margin-top:10px">⚠ Ky email është regjistruar tashmë. Kontrolloni emailin tuaj.</p>
-      <p class="err" id="err-gen" style="margin-top:10px"></p>
-      <button class="btn" id="btn-reg" onclick="submit()">Regjistrohu & Merr Kodin QR →</button>
+      <p class="err" id="err-step1" style="margin-top:10px"></p>
+      <button class="btn" id="btn-send-otp" onclick="sendOtp()">Dërgo Kodin e Verifikimit →</button>
+      <p class="note">Do të dërgojmë një kod 6-shifror në email-in tënd për të verifikuar që është i jotë.</p>
     </div>
-    <p class="note">Pas regjistrimit do të merrni kodin QR direkt në email.</p>
+
+    <!-- STEP 2: Verify OTP -->
+    <div id="step-2" class="card">
+      <div class="step-badge">HAPI 2/2 · Verifikim</div>
+      <div class="step-title">Shkruaj kodin 6-shifror</div>
+      <div class="step-sub">Dërguam një kod në <strong id="sent-to"></strong>.<br>Kontrollo emailin (edhe dosjen <em>Spam</em>).</div>
+
+      <div class="field" style="margin-bottom:0">
+        <label>Kodi i Verifikimit</label>
+        <input id="otp-input" class="otp-input" type="text" inputmode="numeric" maxlength="6" placeholder="••••••" autocomplete="one-time-code">
+        <p class="err" id="err-otp"></p>
+      </div>
+      <p class="err" id="err-step2" style="margin-top:10px"></p>
+
+      <button class="btn" id="btn-verify" onclick="verifyOtp()">Verifiko & Merr QR →</button>
+      <button class="btn-ghost" id="btn-resend" onclick="resendOtp()">Dërgo kodin përsëri</button>
+      <button class="btn-link" onclick="goBack()">← Ndrysho email-in</button>
+    </div>
   </div>
+
+  <!-- SUCCESS -->
   <div id="success">
     <div class="sicon">🎉</div>
     <div class="stitle">Regjistrimi u krye!</div>
