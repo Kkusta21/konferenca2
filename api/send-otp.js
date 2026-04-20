@@ -9,7 +9,7 @@ function initFirebase() {
 }
 
 // Public image URL served from the GitHub repo
-const LOGO_URL   = 'https://raw.githubusercontent.com/Kkusta21/konferenca2/main/assets/logo.png';
+const LOGO_URL   = 'https://raw.githubusercontent.com/Kkusta21/konferenca2/main/assets/logo.jpg';
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
