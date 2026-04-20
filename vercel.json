@@ -2,11 +2,15 @@
   "version": 2,
   "builds": [
     { "src": "api/send-email.js", "use": "@vercel/node" },
-    { "src": "*.html", "use": "@vercel/static" }
+    { "src": "api/send-otp.js",   "use": "@vercel/node" },
+    { "src": "api/verify-otp.js", "use": "@vercel/node" },
+    { "src": "*.html",            "use": "@vercel/static" }
   ],
   "routes": [
     { "src": "/api/send-email", "dest": "/api/send-email.js" },
-    { "src": "/(.*\\.html)", "dest": "/$1" },
-    { "src": "/", "dest": "/regjistrohu.html" }
+    { "src": "/api/send-otp",   "dest": "/api/send-otp.js" },
+    { "src": "/api/verify-otp", "dest": "/api/verify-otp.js" },
+    { "src": "/(.*\\.html)",    "dest": "/$1" },
+    { "src": "/",               "dest": "/regjistrohu.html" }
   ]
 }
