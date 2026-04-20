@@ -1,6 +1,6 @@
 import nodemailer from 'nodemailer';
 
-const LOGO_URL   = 'https://raw.githubusercontent.com/Kkusta21/konferenca2/main/assets/logo.jpg';
+const LOGO_URL   = 'https://raw.githubusercontent.com/Kkusta21/konferenca2/main/assets/logo.png';
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -27,7 +27,7 @@ export default async function handler(req, res) {
 
         <tr><td style="background:#c8102e;height:6px;font-size:0;line-height:0;">&nbsp;</td></tr>
         <tr><td style="padding:32px 32px 10px;text-align:center;border-bottom:2px solid #c8102e;">
-          <img src="${LOGO_URL}" alt="KKSHM" width="64" height="64" style="width:64px;height:64px;border-radius:50%;border:2px solid #c8102e;padding:2px;background:#fff;">
+          <img src="${LOGO_URL}" alt="KKSHM" width="72" height="72" style="display:inline-block;width:72px;height:72px;border:0;outline:none;text-decoration:none;-ms-interpolation-mode:bicubic;">
           <p style="margin:10px 0 4px;color:#c8102e;font-size:0.72rem;letter-spacing:0.25em;text-transform:uppercase;font-weight:600;">Viti i 14-të</p>
           <h1 style="margin:0 0 6px;font-family:'Oswald','Helvetica Neue',Arial,sans-serif;font-size:1.3rem;font-weight:700;text-transform:uppercase;line-height:1.2;letter-spacing:0.5px;">
             Konferenca Kombëtare<br>e Shkencave Mjekësore
